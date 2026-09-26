@@ -16,7 +16,7 @@
 ![Laravel Focus](https://img.shields.io/badge/Laravel-focused-red.svg)
 ![Bangla English](https://img.shields.io/badge/Bangla--English-supported-brightgreen.svg)
 
-**ArtixCode IDE** is a planned AI-native developer environment by **Artixcore**, designed for cloud coding, desktop coding, codebase audit, debugging, secure engineering, and safe AI-generated patch workflows.
+**Artixcode IDE** is a planned AI-native developer environment by **Artixcore**, designed for cloud coding, desktop coding, codebase audit, debugging, secure engineering, and safe AI-generated patch workflows.
 
 ArtixCode IDE is planned to use **Eclipse Theia** as a possible foundation for building a custom cloud and desktop IDE experience, while adding ArtixCode’s own AI model ecosystem, agent system, cloud workspace system, and mobile command layer.
 
