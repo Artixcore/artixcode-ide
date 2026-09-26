@@ -90,6 +90,12 @@ describe('PromptService', () => {
         expect(prompt?.text).to.equal('Ciao, {{invalid}}!');
     });
 
+    it('should insert argument values literally without expanding replacement patterns', async () => {
+        const value = "echo $$ $' $& $`";
+        const prompt = await promptService.getResolvedPromptFragment('1', { name: value });
+        expect(prompt?.text).to.equal(`Hello, ${value}!`);
+    });
+
     it('should return undefined if the prompt fragment id is not found', async () => {
         const prompt = await promptService.getResolvedPromptFragment('4');
         expect(prompt).to.be.undefined;
@@ -363,6 +369,61 @@ describe('PromptService', () => {
 
         // Verify that the tool invocation registry was called
         expect(toolInvocationRegistry.getFunction.calledWith('testFunction')).to.be.true;
+
+        // The reference was not deferred, so deferredFunctionIds should be undefined
+        expect(resolvedPrompt?.deferredFunctionIds).to.be.undefined;
+    });
+
+    it('should mark functions referenced with the `?` prefix as deferred', async () => {
+        const toolInvocationRegistry = {
+            getFunction: sinon.stub()
+        };
+
+        const eagerTool: ToolRequest = {
+            id: 'eagerTool',
+            name: 'Eager Tool',
+            parameters: { type: 'object', properties: {} },
+            handler: sinon.stub()
+        };
+        const deferredTool: ToolRequest = {
+            id: 'deferredTool',
+            name: 'Deferred Tool',
+            parameters: { type: 'object', properties: {} },
+            handler: sinon.stub()
+        };
+        toolInvocationRegistry.getFunction.withArgs('eagerTool').returns(eagerTool);
+        toolInvocationRegistry.getFunction.withArgs('deferredTool').returns(deferredTool);
+
+        const container = new Container();
+        container.bind<PromptService>(PromptService).to(PromptServiceImpl).inSingletonScope();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        container.bind<ToolInvocationRegistry>(ToolInvocationRegistry).toConstantValue(toolInvocationRegistry as any);
+
+        const variableService = new DefaultAIVariableService({ getContributions: () => [] });
+        container.bind<AIVariableService>(AIVariableService).toConstantValue(variableService);
+        container.bind<ILogger>(ILogger).toConstantValue(new MockLogger);
+
+        const testPromptService = container.get<PromptService>(PromptService);
+        testPromptService.addBuiltInPromptFragment({
+            id: 'mixed',
+            template: 'Use ~{eagerTool} eagerly and ~{?deferredTool} on demand.'
+        });
+
+        const resolvedPrompt = await testPromptService.getResolvedPromptFragment('mixed');
+
+        expect(resolvedPrompt).to.not.be.undefined;
+        expect(resolvedPrompt?.functionDescriptions?.size).to.equal(2);
+        expect(resolvedPrompt?.functionDescriptions?.get('eagerTool')).to.deep.equal(eagerTool);
+        expect(resolvedPrompt?.functionDescriptions?.get('deferredTool')).to.deep.equal(deferredTool);
+
+        expect(resolvedPrompt?.deferredFunctionIds).to.not.be.undefined;
+        expect(resolvedPrompt?.deferredFunctionIds?.size).to.equal(1);
+        expect(resolvedPrompt?.deferredFunctionIds?.has('deferredTool')).to.be.true;
+        expect(resolvedPrompt?.deferredFunctionIds?.has('eagerTool')).to.be.false;
+
+        // The deferred marker should be stripped from the resolved text
+        expect(resolvedPrompt?.text).to.not.include('~{eagerTool}');
+        expect(resolvedPrompt?.text).to.not.include('~{?deferredTool}');
     });
 
     // ===== Command Tests =====
@@ -507,6 +568,62 @@ describe('PromptService', () => {
             expect(fragment).to.be.undefined;
         });
     });
+
+    describe('isKnownCommand', () => {
+        it('accepts a registered command name', () => {
+            promptService.addBuiltInPromptFragment({
+                id: 'sample-debug',
+                template: 'Help debug: $ARGUMENTS',
+                isCommand: true,
+                commandName: 'debug'
+            });
+
+            expect(promptService.isKnownCommand('debug')).to.be.true;
+        });
+
+        it('accepts a command fragment referenced by its id', () => {
+            promptService.addBuiltInPromptFragment({
+                id: 'sample-debug',
+                template: 'Help debug: $ARGUMENTS',
+                isCommand: true,
+                commandName: 'debug'
+            });
+
+            expect(promptService.isKnownCommand('sample-debug')).to.be.true;
+        });
+
+        it('accepts the id of a fragment that is not marked as a command', () => {
+            // The `prompt` variable falls back to a plain fragment lookup, so `/normal-fragment`
+            // resolves and must therefore be recognized here as well.
+            promptService.addBuiltInPromptFragment({
+                id: 'normal-fragment',
+                template: 'Not a command'
+            });
+
+            expect(promptService.isKnownCommand('normal-fragment')).to.be.true;
+        });
+
+        it('rejects unknown names', () => {
+            promptService.addBuiltInPromptFragment({
+                id: 'sample-debug',
+                template: 'Help debug: $ARGUMENTS',
+                isCommand: true,
+                commandName: 'debug'
+            });
+
+            expect(promptService.isKnownCommand('home')).to.be.false;
+            expect(promptService.isKnownCommand('usr')).to.be.false;
+            expect(promptService.isKnownCommand('debugger')).to.be.false;
+        });
+
+        it('rejects the empty name', () => {
+            expect(promptService.isKnownCommand('')).to.be.false;
+        });
+
+        it('rejects names when nothing is registered', () => {
+            expect(promptService.isKnownCommand('anything')).to.be.false;
+        });
+    });
 });
 
 describe('CustomAgentDescription', () => {
@@ -556,5 +673,48 @@ describe('CustomAgentDescription', () => {
             expect(CustomAgentDescription.is({ id: 'test' })).to.be.false;
             expect(CustomAgentDescription.is({ id: 'test', name: 'Test' })).to.be.false;
         });
+    });
+});
+
+describe('PromptService variable arguments', () => {
+    let promptService: PromptService;
+
+    beforeEach(() => {
+        const container = new Container();
+        container.bind<PromptService>(PromptService).to(PromptServiceImpl).inSingletonScope();
+
+        const variableService = new DefaultAIVariableService({ getContributions: () => [] });
+        (variableService as unknown as Record<string, unknown>)['logger'] = sinon.createStubInstance(Logger);
+        // A resolver that echoes what it was given, so that the test asserts on the split of the
+        // reference into variable name and argument rather than on any resolver behaviour.
+        const fileVariable = { id: 'file', name: 'file', description: 'Echoes its argument' };
+        variableService.registerResolver(fileVariable, {
+            canResolve: () => 100,
+            resolve: async request => ({ variable: fileVariable, value: `arg=${request.arg}` })
+        });
+        container.bind<AIVariableService>(AIVariableService).toConstantValue(variableService);
+        container.bind<ILogger>(ILogger).toConstantValue(new MockLogger);
+
+        promptService = container.get<PromptService>(PromptService);
+    });
+
+    it('keeps the whole argument of a variable reference whose argument contains further colons', async () => {
+        // Regression test: the reference used to be split with `split(':', 2)`, which truncates, so a
+        // Windows path lost everything from its drive-letter colon onwards.
+        promptService.addBuiltInPromptFragment({ id: 'windows-path', template: 'Read {{file:C:\\some\\path}}' });
+        const prompt = await promptService.getResolvedPromptFragment('windows-path');
+        expect(prompt?.text).to.equal('Read arg=C:\\some\\path');
+    });
+
+    it('keeps a single-colon argument intact', async () => {
+        promptService.addBuiltInPromptFragment({ id: 'simple-arg', template: 'Read {{file:workspace/path/name.ext}}' });
+        const prompt = await promptService.getResolvedPromptFragment('simple-arg');
+        expect(prompt?.text).to.equal('Read arg=workspace/path/name.ext');
+    });
+
+    it('resolves a reference without an argument with an undefined argument', async () => {
+        promptService.addBuiltInPromptFragment({ id: 'no-arg', template: 'Read {{file}}' });
+        const prompt = await promptService.getResolvedPromptFragment('no-arg');
+        expect(prompt?.text).to.equal('Read arg=undefined');
     });
 });

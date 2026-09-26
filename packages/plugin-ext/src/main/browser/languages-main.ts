@@ -80,13 +80,16 @@ import {
     EvaluatableExpressionProvider,
     InlineValue,
     InlineValueContext,
-    InlineValuesProvider
+    InlineValuesProvider,
+    MultiDocumentHighlightProvider
 } from '@theia/monaco-editor-core/esm/vs/editor/common/languages';
 import { ITextModel } from '@theia/monaco-editor-core/esm/vs/editor/common/model';
 import { CodeActionTriggerKind } from '../../plugin/types-impl';
 import { IReadonlyVSDataTransfer } from '@theia/monaco-editor-core/esm/vs/base/common/dataTransfer';
 import { FileUploadService } from '@theia/filesystem/lib/common/upload/file-upload';
 import { ILogger } from '@theia/core';
+import { NotebookService } from '@theia/notebook/lib/browser';
+import { CellEditType, CellUri } from '@theia/notebook/lib/common';
 
 @injectable()
 export class LanguagesMainImpl implements LanguagesMain, Disposable {
@@ -109,6 +112,9 @@ export class LanguagesMainImpl implements LanguagesMain, Disposable {
     @inject(FileUploadService)
     protected readonly fileUploadService: FileUploadService;
 
+    @inject(NotebookService)
+    protected readonly notebookService: NotebookService;
+
     @inject(ILogger) @named('plugin-ext:LanguagesMainImpl')
     protected readonly logger: ILogger;
 
@@ -128,18 +134,35 @@ export class LanguagesMainImpl implements LanguagesMain, Disposable {
         return Promise.resolve(monaco.languages.getLanguages().map(l => l.id));
     }
 
-    $changeLanguage(resource: UriComponents, languageId: string): Promise<void> {
-        const uri = monaco.Uri.revive(resource);
-        const model = monaco.editor.getModel(uri);
-        if (!model) {
-            return Promise.reject(new Error('Invalid uri'));
+    async $changeLanguage(resource: UriComponents, languageId: string): Promise<void> {
+        if (!monaco.languages.getEncodedLanguageId(languageId)) {
+            throw new Error(`Unknown language ID: ${languageId}`);
         }
-        const langId = monaco.languages.getEncodedLanguageId(languageId);
-        if (!langId) {
-            return Promise.reject(new Error(`Unknown language ID: ${languageId}`));
+        const cell = CellUri.parse(URI.fromComponents(resource));
+        if (cell) {
+            this.changeCellLanguage(cell.notebook, cell.handle, languageId);
+            return;
+        }
+        const model = monaco.editor.getModel(monaco.Uri.revive(resource));
+        if (!model) {
+            throw new Error('Invalid uri');
         }
         monaco.editor.setModelLanguage(model, languageId);
-        return Promise.resolve(undefined);
+    }
+
+    /**
+     * The cell model owns a cell's language; kernel selection, serialization, and the cell editor all follow it.
+     */
+    protected changeCellLanguage(notebookUri: URI, handle: number, languageId: string): void {
+        const notebook = this.notebookService.getNotebookEditorModel(notebookUri);
+        if (!notebook) {
+            throw new Error('Invalid uri');
+        }
+        const index = notebook.getCellIndexByHandle(handle);
+        if (index < 0) {
+            throw new Error('Invalid uri');
+        }
+        notebook.applyEdits([{ editType: CellEditType.CellLanguage, index, language: languageId }], true);
     }
 
     protected register(handle: number, service: Disposable): void {
@@ -353,7 +376,8 @@ export class LanguagesMainImpl implements LanguagesMain, Disposable {
 
     protected createHoverProvider(handle: number): monaco.languages.HoverProvider {
         return {
-            provideHover: (model, position, token) => this.provideHover(handle, model, position, token)
+            provideHover: (model, position, token, context) =>
+                this.provideHover(handle, model, position, token, context as monaco.languages.HoverContext<HoverWithId> | undefined)
         };
     }
 
@@ -446,6 +470,45 @@ export class LanguagesMainImpl implements LanguagesMain, Disposable {
             }
 
             return undefined;
+        });
+    }
+
+    $registerMultiDocumentHighlightProvider(handle: number, _pluginInfo: PluginInfo, selector: SerializedDocumentFilter[]): void {
+        const languageSelector = this.toLanguageSelector(selector);
+        const multiDocumentHighlightProvider = this.createMultiDocumentHighlightProvider(handle, languageSelector);
+        this.register(handle,
+            StandaloneServices.get(ILanguageFeaturesService).multiDocumentHighlightProvider.register(languageSelector, multiDocumentHighlightProvider));
+    }
+
+    protected createMultiDocumentHighlightProvider(handle: number, selector: LanguageSelector): MultiDocumentHighlightProvider {
+        return {
+            selector,
+            provideMultiDocumentHighlights: (model, position, otherModels, token) =>
+                // @monaco-uplift: cast due to ITextModel enum incompatibility between internal and standalone API types
+                this.provideMultiDocumentHighlights(handle, model as unknown as monaco.editor.ITextModel, position,
+                    otherModels as unknown as monaco.editor.ITextModel[], token)
+        };
+    }
+
+    protected provideMultiDocumentHighlights(
+        handle: number, model: monaco.editor.ITextModel, position: monaco.Position,
+        otherModels: monaco.editor.ITextModel[], token: monaco.CancellationToken
+    ): monaco.languages.ProviderResult<Map<monaco.Uri, monaco.languages.DocumentHighlight[]>> {
+        const otherResources = otherModels.map(m => m.uri);
+        return this.proxy.$provideMultiDocumentHighlights(handle, model.uri, position, otherResources, token).then(result => {
+            if (!result) {
+                return undefined;
+            }
+            const map = new Map<monaco.Uri, monaco.languages.DocumentHighlight[]>();
+            for (const entry of result) {
+                const uri = monaco.Uri.revive(entry.uri);
+                const highlights: monaco.languages.DocumentHighlight[] = entry.highlights.map(item => ({
+                    ...item,
+                    kind: item.kind ?? monaco.languages.DocumentHighlightKind.Text
+                }));
+                map.set(uri, highlights);
+            }
+            return map;
         });
     }
 

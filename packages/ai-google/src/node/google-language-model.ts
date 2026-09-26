@@ -15,7 +15,9 @@
 // *****************************************************************************
 import {
     createToolCallError,
+    formatToolCallContentForModel,
     ImageContent,
+    isToolCallContent,
     LanguageModel,
     LanguageModelMessage,
     LanguageModelRequest,
@@ -26,15 +28,21 @@ import {
     LanguageModelTextResponse,
     ReasoningApi,
     ReasoningSupport,
+    ServerToolCall,
+    ServerToolDescriptor,
+    TokenUsageParams,
     ToolCallResult,
     ToolInvocationContext,
     UserRequest
 } from '@theia/ai-core';
 import { CancellationToken } from '@theia/core';
-import { GoogleGenAI, FunctionCallingConfigMode, FunctionDeclaration, Content, Schema, Part, Modality, FunctionResponse, ToolConfig } from '@google/genai';
+import {
+    GoogleGenAI, FunctionCallingConfigMode, FunctionDeclaration, Content, Schema, Part, Modality, FunctionResponse, ToolConfig, Tool, UrlContextMetadata, GroundingMetadata
+} from '@google/genai';
 import { wait } from '@theia/core/lib/common/promise-util';
 import { GoogleLanguageModelRetrySettings } from './google-language-models-manager-impl';
 import { googleReasoningFor } from './google-reasoning';
+import { GOOGLE_GOOGLE_SEARCH, GOOGLE_URL_CONTEXT } from './google-server-tools';
 import { UUID } from '@theia/core/shared/@lumino/coreutils';
 
 interface ToolCallback {
@@ -49,6 +57,9 @@ interface ToolCallback {
 function toFunctionResponse(content: ToolCallResult): FunctionResponse['response'] {
     if (content === undefined) {
         return {};
+    }
+    if (isToolCallContent(content)) {
+        return { result: formatToolCallContentForModel(content) };
     }
     if (Array.isArray(content)) {
         return { result: content };
@@ -71,6 +82,10 @@ const convertMessageToPart = (message: LanguageModelMessage): Part[] | undefined
         }];
     } else if (LanguageModelMessage.isToolResultMessage(message)) {
         return [{ functionResponse: { name: message.name, response: toFunctionResponse(message.content) } }];
+    } else if (LanguageModelMessage.isServerToolUseMessage(message)) {
+        // Gemini grounding / url-context is informational and re-derived by the provider on each turn,
+        // so server tool invocations are not replayed into the conversation history.
+        return undefined;
     } else if (LanguageModelMessage.isThinkingMessage(message)) {
         return [{ thought: true, text: message.thinking }];
     } else if (LanguageModelMessage.isImageMessage(message) && ImageContent.isBase64(message.image)) {
@@ -141,7 +156,24 @@ function toGoogleRole(message: LanguageModelMessage): 'user' | 'model' {
  * Implements the Gemini language model integration for Theia. Reasoning-level
  * translation lives in {@link googleReasoningFor}.
  */
+/** Options for {@link createGoogleClient}. */
+export interface GoogleClientOptions {
+    readonly apiKey: string;
+}
+
+/**
+ * The single place a Gemini SDK client is built, so that a chat request, a model lookup and the model
+ * discovery all reach the provider the same way.
+ */
+export function createGoogleClient(options: GoogleClientOptions): GoogleGenAI {
+    // TODO test vertexai
+    return new GoogleGenAI({ apiKey: options.apiKey, vertexai: false });
+}
+
 export class GoogleModel implements LanguageModel {
+
+    /** Provider identifier, used to key per-provider settings (e.g. server tool selections) and the capabilities UI. */
+    readonly vendor = 'google';
 
     constructor(
         public readonly id: string,
@@ -152,7 +184,8 @@ export class GoogleModel implements LanguageModel {
         public retrySettings: () => GoogleLanguageModelRetrySettings,
         public reasoningSupport?: ReasoningSupport,
         public reasoningApi?: ReasoningApi,
-        public maxInputTokens?: number
+        public maxInputTokens?: number,
+        public serverTools?: ServerToolDescriptor[]
     ) { }
 
     protected getSettings(request: LanguageModelRequest): Readonly<Record<string, unknown>> {
@@ -188,6 +221,7 @@ export class GoogleModel implements LanguageModel {
         const settings = this.getSettings(request);
         const { contents: parts, systemMessage } = transformToGeminiMessages(request.messages);
         const functionDeclarations = this.createFunctionDeclarations(request);
+        const tools = this.createTools(request, functionDeclarations);
 
         const toolConfig: ToolConfig = {};
 
@@ -195,6 +229,11 @@ export class GoogleModel implements LanguageModel {
             toolConfig.functionCallingConfig = {
                 mode: FunctionCallingConfigMode.AUTO,
             };
+        }
+        // Required by Gemini when combining server tools (urlContext / googleSearch) with function
+        // declarations; without it the API rejects the request with INVALID_ARGUMENT.
+        if ((request.serverTools?.length ?? 0) > 0) {
+            toolConfig.includeServerSideToolInvocations = true;
         }
 
         // Wrap the API call in the retry mechanism
@@ -205,11 +244,7 @@ export class GoogleModel implements LanguageModel {
                     systemInstruction: systemMessage,
                     toolConfig,
                     responseModalities: [Modality.TEXT],
-                    ...(functionDeclarations.length > 0 && {
-                        tools: [{
-                            functionDeclarations
-                        }]
-                    }),
+                    ...(tools.length > 0 && { tools }),
                     temperature: 1,
                     ...settings
                 },
@@ -222,12 +257,23 @@ export class GoogleModel implements LanguageModel {
             async *[Symbol.asyncIterator](): AsyncIterator<LanguageModelStreamResponsePart> {
                 const toolCallMap: { [key: string]: ToolCallback } = {};
                 const collectedParts: Part[] = [];
+                // Server tool (url_context / google_search) metadata is reported on the candidate, usually in the final chunk.
+                let latestUrlContextMetadata: UrlContextMetadata | undefined;
+                let latestGroundingMetadata: GroundingMetadata | undefined;
                 try {
+                    let tokenUsage: TokenUsageParams | undefined = undefined;
                     for await (const chunk of stream) {
                         if (cancellationToken?.isCancellationRequested) {
                             break;
                         }
-                        const finishReason = chunk.candidates?.[0].finishReason;
+                        const candidate = chunk.candidates?.[0];
+                        if (candidate?.urlContextMetadata) {
+                            latestUrlContextMetadata = candidate.urlContextMetadata;
+                        }
+                        if (candidate?.groundingMetadata) {
+                            latestGroundingMetadata = candidate.groundingMetadata;
+                        }
+                        const finishReason = candidate?.finishReason;
                         if (finishReason) {
                             switch (finishReason) {
                                 // 'STOP' is the only valid (non-error) finishReason
@@ -315,14 +361,29 @@ export class GoogleModel implements LanguageModel {
                             yield { content: chunk.text };
                         }
 
-                        // Report token usage if available
+                        // Remember the token usage as Gemini's metadata is cumulative
                         if (chunk.usageMetadata) {
                             const promptTokens = chunk.usageMetadata.promptTokenCount;
                             const completionTokens = chunk.usageMetadata.candidatesTokenCount;
                             if (promptTokens !== undefined && completionTokens !== undefined) {
-                                yield { input_tokens: promptTokens, output_tokens: completionTokens };
+                                tokenUsage = {
+                                    inputTokens: promptTokens,
+                                    outputTokens: completionTokens,
+                                    requestId: request.requestId
+                                };
                             }
                         }
+                    }
+
+                    // Report token usage if available
+                    if (tokenUsage !== undefined && that.id) {
+                        yield { input_tokens: tokenUsage.inputTokens, output_tokens: tokenUsage.outputTokens };
+                    }
+
+                    // Surface any server tools (url_context / google_search) that the provider executed.
+                    const serverToolCalls = that.buildServerToolCalls(latestUrlContextMetadata, latestGroundingMetadata);
+                    if (serverToolCalls.length > 0) {
+                        yield { server_tool_calls: serverToolCalls };
                     }
 
                     // Process tool calls if any exist
@@ -411,6 +472,69 @@ export class GoogleModel implements LanguageModel {
         }));
     }
 
+    /**
+     * Builds the Gemini `tools` array, combining client function declarations with the enabled native server tools.
+     *
+     * Note: combining native tools (`googleSearch` / `urlContext`) with `functionDeclarations` in a single
+     * request requires a Gemini 2.0+ model. Older models (e.g. Gemini 1.5) reject the combination with a 400
+     * error. Since adopters configure both the model and which server tools to offer, this is left to the
+     * provider rather than silently dropping either set of tools.
+     */
+    protected createTools(request: LanguageModelRequest, functionDeclarations: FunctionDeclaration[]): Tool[] {
+        const tools: Tool[] = [];
+        if (functionDeclarations.length > 0) {
+            tools.push({ functionDeclarations });
+        }
+        const serverTools = request.serverTools ?? [];
+        if (serverTools.includes(GOOGLE_URL_CONTEXT)) {
+            tools.push({ urlContext: {} });
+        }
+        if (serverTools.includes(GOOGLE_GOOGLE_SEARCH)) {
+            tools.push({ googleSearch: {} });
+        }
+        return tools;
+    }
+
+    /**
+     * Summarizes the provider-executed server tools (url_context / google_search) into finished
+     * {@link ServerToolCall}s for display. Gemini does not provide tool ids, so a fresh id is generated;
+     * these calls are informational and are not replayed into the conversation history.
+     */
+    protected buildServerToolCalls(urlContextMetadata?: UrlContextMetadata, groundingMetadata?: GroundingMetadata): ServerToolCall[] {
+        const calls: ServerToolCall[] = [];
+        const urlMetadata = urlContextMetadata?.urlMetadata?.filter(entry => entry.retrievedUrl);
+        if (urlMetadata && urlMetadata.length > 0) {
+            const summary = urlMetadata.map(entry => `${entry.retrievedUrl} (${entry.urlRetrievalStatus ?? 'unknown'})`).join('\n');
+            calls.push({
+                id: UUID.uuid4().replace(/-/g, ''),
+                name: GOOGLE_URL_CONTEXT,
+                arguments: JSON.stringify({ urls: urlMetadata.map(entry => entry.retrievedUrl) }),
+                finished: true,
+                result: { content: [{ type: 'text', text: summary }] }
+            });
+        }
+        const webSearchQueries = groundingMetadata?.webSearchQueries;
+        if (webSearchQueries && webSearchQueries.length > 0) {
+            const sources = (groundingMetadata?.groundingChunks ?? [])
+                .map(chunk => chunk.web)
+                .filter((web): web is NonNullable<typeof web> => !!web)
+                .map(web => web.uri ? `${web.title ?? web.uri} (${web.uri})` : `${web.title ?? ''}`)
+                .filter(entry => entry.length > 0);
+            const summaryParts = [`Queries: ${webSearchQueries.join(', ')}`];
+            if (sources.length > 0) {
+                summaryParts.push(`Sources:\n${sources.join('\n')}`);
+            }
+            calls.push({
+                id: UUID.uuid4().replace(/-/g, ''),
+                name: GOOGLE_GOOGLE_SEARCH,
+                arguments: JSON.stringify({ queries: webSearchQueries }),
+                finished: true,
+                result: { content: [{ type: 'text', text: summaryParts.join('\n\n') }] }
+            });
+        }
+        return calls;
+    }
+
     protected async handleNonStreamingRequest(
         genAI: GoogleGenAI,
         request: UserRequest
@@ -439,10 +563,11 @@ export class GoogleModel implements LanguageModel {
 
         try {
             let responseText = '';
-            // For non streaming requests we are always only interested in text parts
+            // For non streaming requests we are always only interested in text parts; thought summaries
+            // (parts flagged `thought`, present when includeThoughts is set) are not part of the answer.
             if (model.candidates?.[0]?.content?.parts) {
                 for (const part of model.candidates[0].content.parts) {
-                    if (part.text) {
+                    if (part.text && !part.thought) {
                         responseText += part.text;
                     }
                 }
@@ -470,8 +595,7 @@ export class GoogleModel implements LanguageModel {
             throw new Error('Please provide GOOGLE_API_KEY in preferences or via environment variable');
         }
 
-        // TODO test vertexai
-        return new GoogleGenAI({ apiKey, vertexai: false });
+        return createGoogleClient({ apiKey });
     }
 
     /**

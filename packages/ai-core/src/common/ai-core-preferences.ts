@@ -24,21 +24,71 @@ import {
     NOTIFICATION_TYPE_DESCRIPTIONS,
     NotificationType
 } from './notification-types';
-import { ReasoningSettings } from './language-model';
+import { ReasoningSettings, SERVER_SIDE_COMPACTION_TOKEN_THRESHOLD_MINIMUM } from './language-model';
 import { PreferenceSchema } from '@theia/core/lib/common/preferences/preference-schema';
 
 export const AI_CORE_PREFERENCES_TITLE = nls.localize('theia/ai-core/preferences/title', 'AI Features');
+
+/**
+ * Key under a preference's schema `typeDetails` where a language-model provider declares the
+ * human-readable name of its provider block. The AI Configuration view's Models page reads this to
+ * label the provider node (discovered from the `ai-features.<provider>.*` preferences) without
+ * having to hard-code provider names. Declare it on any one preference of the provider's block, e.g.
+ * `typeDetails: { [MODEL_PROVIDER_TYPE_DETAIL]: 'Anthropic' }`.
+ */
+export const MODEL_PROVIDER_TYPE_DETAIL = 'aiModelProvider';
+
+/**
+ * Key under a preference's schema `typeDetails` marking a preference that the AI Configuration view
+ * edits through a dedicated control of its own, so it should not also appear as a raw settings row.
+ * The value stays a plain preference, editable in `settings.json` like any other; it is only the
+ * duplicate, less legible editor that is left out. Declare it as
+ * `typeDetails: { [DEDICATED_EDITOR_TYPE_DETAIL]: true }`.
+ */
+export const DEDICATED_EDITOR_TYPE_DETAIL = 'aiDedicatedEditor';
+
+/**
+ * Shape a language-model provider stores under a preference's `typeDetails[MODEL_PROVIDER_TYPE_DETAIL]`
+ * to describe its `ai-features.<provider>.*` block to the AI Configuration view's Models page. Declared
+ * on any one preference of the block, e.g. `typeDetails: { [MODEL_PROVIDER_TYPE_DETAIL]: { label: 'Anthropic' } }`.
+ */
+export interface ModelProviderTypeDetail {
+    /** Human-readable provider name shown as the provider node/card label. */
+    label: string;
+}
 export const PREFERENCE_NAME_PROMPT_TEMPLATES = 'ai-features.promptTemplates.promptTemplatesFolder';
 export const PREFERENCE_NAME_REQUEST_SETTINGS = 'ai-features.modelSettings.requestSettings';
 export const PREFERENCE_NAME_REASONING = 'ai-features.reasoning.defaults';
 export const PREFERENCE_NAME_MAX_RETRIES = 'ai-features.modelSettings.maxRetries';
+export const PREFERENCE_NAME_FAVORITE_MODELS = 'ai-features.modelSettings.favoriteModels';
+export const PREFERENCE_NAME_HIDDEN_MODELS = 'ai-features.modelSettings.hiddenModels';
 export const PREFERENCE_NAME_DEFAULT_NOTIFICATION_TYPE = 'ai-features.notifications.default';
 export const PREFERENCE_NAME_SKILL_DIRECTORIES = 'ai-features.skills.skillDirectories';
+export const PREFERENCE_NAME_SERVER_SIDE_COMPACTION = 'ai-features.chat.serverSideCompaction';
+export const PREFERENCE_NAME_SERVER_SIDE_COMPACTION_TOKEN_THRESHOLD = 'ai-features.chat.serverSideCompactionTokenThreshold';
 
 export const LANGUAGE_MODEL_ALIASES_PREFERENCE = 'ai-features.languageModelAliases';
 
 export const aiCorePreferenceSchema: PreferenceSchema = {
     properties: {
+        [PREFERENCE_NAME_SERVER_SIDE_COMPACTION]: {
+            title: AI_CORE_PREFERENCES_TITLE,
+            type: 'boolean',
+            description: nls.localize('theia/ai/core/serverSideCompaction/description',
+                'Enable provider-native server-side compaction by default for chat requests. When on, models that support it ' +
+                'may automatically summarize older turns once the conversation grows past their own threshold, letting long ' +
+                'sessions continue past the context limit. Each provider offers its own override, and individual chat sessions ' +
+                'can override this in their session settings. Models without support ignore it.'),
+            default: true,
+        },
+        [PREFERENCE_NAME_SERVER_SIDE_COMPACTION_TOKEN_THRESHOLD]: {
+            title: AI_CORE_PREFERENCES_TITLE,
+            type: 'integer',
+            minimum: SERVER_SIDE_COMPACTION_TOKEN_THRESHOLD_MINIMUM,
+            description: nls.localize('theia/ai/core/serverSideCompactionTokenThreshold/description',
+                'Default input-token threshold at which provider-native server-side compaction should run. Providers and individual chat sessions ' +
+                'can override this value. When unset, the provider chooses its default threshold. If set, the value must be at least 50,000 tokens.'),
+        },
         [PREFERENCE_NAME_PROMPT_TEMPLATES]: {
             title: AI_CORE_PREFERENCES_TITLE,
             description: nls.localize('theia/ai/core/promptTemplates/description',
@@ -130,10 +180,39 @@ export const aiCorePreferenceSchema: PreferenceSchema = {
             minimum: 0,
             default: 3
         },
+        [PREFERENCE_NAME_FAVORITE_MODELS]: {
+            title: nls.localize('theia/ai/core/favoriteModels/title', 'Favorite Models'),
+            markdownDescription: nls.localize('theia/ai/core/favoriteModels/mdDescription',
+                'Models the AI chat input\'s model picker shows in addition to the newest ones of each provider, as fully qualified ids '
+                + '(e.g. `anthropic/claude-opus-5`). This is for keeping an older or release-pinned model at hand. Check a model on its '
+                + 'provider\'s page in the AI Configuration view to add it.'),
+            type: 'array',
+            // The provider pages check models one by one; a second, raw editor for the same ids would
+            // invite typos and disagree with what the checks say.
+            typeDetails: { [DEDICATED_EDITOR_TYPE_DETAIL]: true },
+            items: {
+                type: 'string'
+            },
+            default: []
+        },
+        [PREFERENCE_NAME_HIDDEN_MODELS]: {
+            title: nls.localizeByDefault('Hidden Models'),
+            markdownDescription: nls.localize('theia/ai/core/hiddenModels/mdDescription',
+                'Models the AI chat input\'s model picker does not show even though it would by default, as fully qualified ids '
+                + '(e.g. `google/gemini-flash-lite-latest`). Only the models shown without being listed as a favorite end up here, '
+                + 'i.e. the newest ones of a provider. Uncheck a model on its provider\'s page in the AI Configuration view to add it.'),
+            type: 'array',
+            typeDetails: { [DEDICATED_EDITOR_TYPE_DETAIL]: true },
+            items: {
+                type: 'string'
+            },
+            default: []
+        },
         [PREFERENCE_NAME_DEFAULT_NOTIFICATION_TYPE]: {
             title: nls.localize('theia/ai/core/defaultNotification/title', 'Default Notification Type'),
             markdownDescription: nls.localize('theia/ai/core/defaultNotification/mdDescription',
-                'The default notification method used when an AI agent completes a task. Individual agents can override this setting.'),
+                'The default notification method used when an AI agent needs your attention, i.e. it completed a task or requests your input. '
+                + 'Individual agents can override this setting.'),
             type: 'string',
             enum: [...NOTIFICATION_TYPES],
             enumItemLabels: NOTIFICATION_TYPES.map(type => NOTIFICATION_TYPE_LABELS[type]),
@@ -236,8 +315,11 @@ export interface AICoreConfiguration {
     [PREFERENCE_NAME_REQUEST_SETTINGS]: Array<RequestSetting> | undefined;
     [PREFERENCE_NAME_REASONING]: Array<ReasoningPreferenceEntry> | undefined;
     [PREFERENCE_NAME_MAX_RETRIES]: number | undefined;
+    [PREFERENCE_NAME_FAVORITE_MODELS]: string[] | undefined;
     [PREFERENCE_NAME_DEFAULT_NOTIFICATION_TYPE]: NotificationType | undefined;
     [PREFERENCE_NAME_SKILL_DIRECTORIES]: string[] | undefined;
+    [PREFERENCE_NAME_SERVER_SIDE_COMPACTION]: boolean | undefined;
+    [PREFERENCE_NAME_SERVER_SIDE_COMPACTION_TOKEN_THRESHOLD]: number | undefined;
 }
 
 export interface RequestSetting {

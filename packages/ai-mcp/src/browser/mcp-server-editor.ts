@@ -74,6 +74,10 @@ export interface MCPInstallOverrides {
     autostart?: boolean;
     /** Filled into a remote server's `serverAuthToken` slot when supplied by the user. */
     serverAuthToken?: string;
+    /** Filled into the entry's `oauth.clientId` slot when supplied by the user. */
+    oauthClientId?: string;
+    /** Filled into the entry's `oauth.clientSecret` slot when supplied by the user. */
+    oauthClientSecret?: string;
 }
 
 /**
@@ -85,10 +89,16 @@ export const MCPServerEditor = Symbol('MCPServerEditor');
 export interface MCPServerEditor {
     /** Opens the "Add MCP Server" dialog and persists the result. */
     openAddServer(): Promise<void>;
-    /** Opens the "Edit MCP Server" dialog pre-filled from `server` and persists the result. */
-    openEditServer(server: MCPServerDescription, existingNames: string[]): Promise<void>;
     /** Installs a self-contained entry, applying any user-supplied overrides. */
     installFromEntry(entry: MCPInstallEntry, overrides?: MCPInstallOverrides): Promise<void>;
+    /**
+     * Persists an edited server from its form representation, preserving extra stored fields (e.g.
+     * `registryMetadata`) and clearing keys that don't belong to the chosen server type. Exposed so the
+     * configuration page can edit a server in place (field by field) without opening the dialog.
+     */
+    save(formData: MCPServerFormData): Promise<void>;
+    /** Converts a server description into the editable form representation, or `undefined` if unsupported. */
+    toFormData(server: MCPServerDescription): MCPServerFormData | undefined;
 }
 
 /**
@@ -117,23 +127,6 @@ export class MCPServerEditorImpl implements MCPServerEditor {
             props: { title: nls.localizeByDefault('Add MCP Server'), maxWidth: 500 },
             existingServerNames: existing,
             isEditing: false
-        });
-        const result = await dialog.open();
-        if (result) {
-            await this.save(result);
-        }
-    }
-
-    async openEditServer(server: MCPServerDescription, existingNames: string[]): Promise<void> {
-        const formData = this.toFormData(server);
-        if (!formData) {
-            return;
-        }
-        const dialog = this.editDialogFactory({
-            props: { title: nls.localize('theia/ai/mcpConfiguration/editServerTitle', 'Edit MCP Server'), maxWidth: 500 },
-            initialData: formData,
-            existingServerNames: existingNames.filter(n => n !== server.name),
-            isEditing: true
         });
         const result = await dialog.open();
         if (result) {
@@ -204,6 +197,15 @@ export class MCPServerEditorImpl implements MCPServerEditor {
         if (overrides.serverAuthToken !== undefined && 'serverAuthToken' in config) {
             merged.serverAuthToken = overrides.serverAuthToken;
         }
+        // Replace the registry's OAuth client placeholders with the user-supplied credentials,
+        // keeping the registry-fixed parts (scopes, authorization server, resource) intact.
+        if (config.oauth && (overrides.oauthClientId !== undefined || overrides.oauthClientSecret !== undefined)) {
+            merged.oauth = {
+                ...config.oauth,
+                ...(overrides.oauthClientId !== undefined && { clientId: overrides.oauthClientId }),
+                ...(overrides.oauthClientSecret !== undefined && { clientSecret: overrides.oauthClientSecret })
+            };
+        }
         return merged;
     }
 
@@ -235,13 +237,13 @@ export class MCPServerEditorImpl implements MCPServerEditor {
         }
     }
 
-    protected toFormData(server: MCPServerDescription): MCPServerFormData | undefined {
+    toFormData(server: MCPServerDescription): MCPServerFormData | undefined {
         if (isLocalMCPServerDescription(server)) {
             return {
                 name: server.name,
                 serverType: 'local',
                 command: server.command,
-                args: server.args?.join(' ') ?? '',
+                args: server.args ?? [],
                 env: server.env ? Object.entries(server.env).map(([k, v]) => `${k}=${v}`).join('\n') : '',
                 serverUrl: '',
                 serverAuthToken: '',
@@ -252,7 +254,8 @@ export class MCPServerEditorImpl implements MCPServerEditor {
                 oauthScopes: '',
                 oauthAuthorizationServer: '',
                 oauthResource: '',
-                autostart: server.autostart ?? true
+                autostart: server.autostart ?? true,
+                deferLoading: server.deferLoading ?? false
             };
         }
         if (isRemoteMCPServerDescription(server)) {
@@ -260,7 +263,7 @@ export class MCPServerEditorImpl implements MCPServerEditor {
                 name: server.name,
                 serverType: server.oauth ? 'remote-oauth' : 'remote',
                 command: '',
-                args: '',
+                args: [],
                 env: '',
                 serverUrl: server.serverUrl,
                 serverAuthToken: server.serverAuthToken ?? '',
@@ -273,7 +276,8 @@ export class MCPServerEditorImpl implements MCPServerEditor {
                 oauthScopes: server.oauth?.scopes?.join(' ') ?? '',
                 oauthAuthorizationServer: server.oauth?.authorizationServer ?? '',
                 oauthResource: server.oauth?.resource ?? '',
-                autostart: server.autostart ?? true
+                autostart: server.autostart ?? true,
+                deferLoading: server.deferLoading ?? false
             };
         }
         return undefined;
@@ -282,10 +286,13 @@ export class MCPServerEditorImpl implements MCPServerEditor {
     protected toLocalConfig(formData: MCPServerFormData): Partial<LocalMCPServerDescription> {
         const config: Partial<LocalMCPServerDescription> = {
             command: formData.command.trim(),
-            autostart: formData.autostart
+            autostart: formData.autostart,
+            deferLoading: formData.deferLoading
         };
-        if (formData.args.trim()) {
-            config.args = formData.args.trim().split(/\s+/);
+        // Kept verbatim (empty entries dropped), so an argument containing a space stays one argument.
+        const args = formData.args.map(argument => argument.trim()).filter(argument => argument.length > 0);
+        if (args.length > 0) {
+            config.args = args;
         }
         const env = parseKeyValuePairs(formData.env);
         if (env) {
@@ -297,7 +304,8 @@ export class MCPServerEditorImpl implements MCPServerEditor {
     protected toRemoteConfig(formData: MCPServerFormData): Partial<RemoteMCPServerDescription> {
         const config: Partial<RemoteMCPServerDescription> = {
             serverUrl: formData.serverUrl.trim(),
-            autostart: formData.autostart
+            autostart: formData.autostart,
+            deferLoading: formData.deferLoading
         };
         if (formData.serverType === 'remote') {
             if (formData.serverAuthToken.trim()) {
@@ -321,8 +329,10 @@ export class MCPServerEditorImpl implements MCPServerEditor {
 
 const STALE_KEYS_BY_SERVER_TYPE: Record<MCPServerFormData['serverType'], readonly string[]> = {
     'local': ['serverUrl', 'serverAuthToken', 'serverAuthTokenHeader', 'headers', 'oauth'],
-    'remote': ['command', 'args', 'env', 'oauth'],
-    'remote-oauth': ['command', 'args', 'env', 'serverAuthToken', 'serverAuthTokenHeader']
+    // The plugin fields go with `command`: they only mean anything for a local server, and leaving
+    // them on an entry the user just turned into a remote one would keep a dead plugin root on it.
+    'remote': ['command', 'args', 'env', 'cwd', 'pluginRoot', 'pluginData', 'oauth'],
+    'remote-oauth': ['command', 'args', 'env', 'cwd', 'pluginRoot', 'pluginData', 'serverAuthToken', 'serverAuthTokenHeader']
 };
 
 function parseKeyValuePairs(input: string): Record<string, string> | undefined {

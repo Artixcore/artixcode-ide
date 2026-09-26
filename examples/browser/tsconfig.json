@@ -39,6 +39,9 @@
       "path": "../../packages/ai-editor"
     },
     {
+      "path": "../../packages/ai-external-api"
+    },
+    {
       "path": "../../packages/ai-google"
     },
     {
@@ -78,7 +81,7 @@
       "path": "../../packages/ai-terminal"
     },
     {
-      "path": "../../packages/ai-vercel-ai"
+      "path": "../../packages/ai-tool-sketchpad"
     },
     {
       "path": "../../packages/bulk-edit"
@@ -106,6 +109,9 @@
     },
     {
       "path": "../../packages/editor-preview"
+    },
+    {
+      "path": "../../packages/external-api"
     },
     {
       "path": "../../packages/file-search"
@@ -168,9 +174,6 @@
       "path": "../../packages/preferences"
     },
     {
-      "path": "../../packages/preview"
-    },
-    {
       "path": "../../packages/process"
     },
     {
@@ -186,9 +189,6 @@
       "path": "../../packages/scm"
     },
     {
-      "path": "../../packages/scm-extra"
-    },
-    {
       "path": "../../packages/search-in-workspace"
     },
     {
@@ -196,6 +196,9 @@
     },
     {
       "path": "../../packages/task"
+    },
+    {
+      "path": "../../packages/telemetry"
     },
     {
       "path": "../../packages/terminal"

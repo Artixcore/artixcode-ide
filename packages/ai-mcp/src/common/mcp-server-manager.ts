@@ -131,6 +131,16 @@ export interface BaseMCPServerDescription {
     autostart?: boolean;
 
     /**
+     * If `true`, all tools provided by this server are marked as deferred in the
+     * generated prompt fragment (`mcp_<name>_tools`). Deferred tools are not
+     * loaded into the model's context upfront and may instead be discovered
+     * on-demand via the model provider's built-in tool search mechanism
+     * (Anthropic, OpenAI) when supported by the provider. Individual tools
+     * may still be referenced explicitly without the deferred marker.
+     */
+    deferLoading?: boolean;
+
+    /**
      * The current status of the server. Optional because only set by the server.
      */
     status?: MCPServerStatus;
@@ -164,8 +174,8 @@ export interface BaseMCPServerDescription {
  * separated from the server configuration the user edits.
  */
 export interface MCPRegistryMetadata {
-    /** Identifies the AI registry entry this server was installed from. */
-    serverId: string;
+    /** Absent for a plugin-contributed server, which carries {@link pluginId} instead. */
+    serverId?: string;
 
     /**
      * Registry-published version recorded at install / link / fix / update time.
@@ -179,8 +189,20 @@ export interface MCPRegistryMetadata {
      * Content hash of the registry approval that produced this entry. Used to detect
      * when the registry has published a new approval for this server. Do not use
      * {@link version} for update checks - it is display-only.
+     *
+     * For an entry written by an Agent Plugin this is the plugin's content hash.
      */
     configHash?: string;
+
+    /** Set when this entry was written by an installed Agent Plugin. */
+    pluginId?: string;
+
+    /**
+     * When the supplying Agent Plugin was last written. Not informational:
+     * `connectionDescription` includes it, so replacing a plugin's root restarts the servers running
+     * out of it even when their own configuration is byte-identical.
+     */
+    installedAt?: string;
 }
 
 /**
@@ -193,10 +215,26 @@ export interface MCPInstallEntryConfig {
     command?: string;
     args?: string[];
     env?: Record<string, string>;
+    /** Working directory for the process. Defaults to `pluginRoot` when that is set. */
+    cwd?: string;
+    /**
+     * Exported as PLUGIN_ROOT. Its own field rather than an `env` entry because the MCP edit dialog
+     * renders `env` as a user-editable KEY=VALUE box, and because the reserved variables have to be
+     * set *after* the plugin's `env` - not expressible once they share one map.
+     */
+    pluginRoot?: string;
+    /** Exported as PLUGIN_DATA. See {@link pluginRoot}. */
+    pluginData?: string;
     serverUrl?: string;
     serverAuthToken?: string;
     serverAuthTokenHeader?: string;
     headers?: Record<string, string>;
+    /**
+     * OAuth configuration for remote servers. The registry supplies the fixed parts (scopes,
+     * authorization server, resource); the confidential-client `clientId`/`clientSecret` are
+     * collected from the user at install time when the entry advertises them.
+     */
+    oauth?: MCPOAuthConfig;
 }
 
 export interface LocalMCPServerDescription extends BaseMCPServerDescription {
@@ -212,6 +250,12 @@ export interface LocalMCPServerDescription extends BaseMCPServerDescription {
      * Environment variables for the MCP server process.
      */
     env?: { [key: string]: string };
+    /** Defaults to {@link pluginRoot} when that is set. */
+    cwd?: string;
+    /** See {@link MCPInstallEntryConfig.pluginRoot} for why this is not folded into {@link env}. */
+    pluginRoot?: string;
+    /** Exported as PLUGIN_DATA. */
+    pluginData?: string;
 }
 
 export interface RemoteMCPServerDescription extends BaseMCPServerDescription {

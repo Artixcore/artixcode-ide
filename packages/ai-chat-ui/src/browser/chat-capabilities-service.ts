@@ -22,7 +22,8 @@ import {
     ParsedCapability,
     GenericCapabilitySelections,
     matchFunctionsRegEx,
-    matchVariablesRegEx
+    matchVariablesRegEx,
+    parseFunctionReference
 } from '@theia/ai-core';
 import { ChatAgentService } from '@theia/ai-chat';
 
@@ -121,15 +122,16 @@ export class ChatCapabilitiesServiceImpl implements ChatCapabilitiesService {
         // Extract all functions using the standard regex
         const functionMatches = matchFunctionsRegEx(template);
         for (const match of functionMatches) {
-            functions.push(match[1]);
+            functions.push(parseFunctionReference(match[1]).id);
         }
 
         // Extract all variables using the standard regex
         const variableMatches = matchVariablesRegEx(template);
         for (const match of variableMatches) {
             const variableAndArg = match[1];
-            const parts = variableAndArg.split(':', 2);
-            const variableName = parts[0];
+            // First colon only, as the prompt service does: `{{file:C:\some\path}}`.
+            const separatorIndex = variableAndArg.indexOf(':');
+            const variableName = separatorIndex >= 0 ? variableAndArg.substring(0, separatorIndex) : variableAndArg;
 
             // Exclude capability and selected_* variables (they're meta-variables)
             if (variableName !== 'capability' &&

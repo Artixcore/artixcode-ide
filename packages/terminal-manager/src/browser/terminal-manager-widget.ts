@@ -20,6 +20,7 @@ import {
     BaseWidget,
     codicon,
     CompositeTreeNode,
+    ExtractableWidget,
     Message,
     Panel,
     PanelLayout,
@@ -35,7 +36,7 @@ import {
 import { Disposable, DisposableCollection, Emitter, nls, ILogger } from '@theia/core';
 import { UUID } from '@theia/core/shared/@lumino/coreutils';
 import { TerminalWidget, TerminalWidgetOptions } from '@theia/terminal/lib/browser/base/terminal-widget';
-import { TerminalWidgetImpl } from '@theia/terminal/lib/browser/terminal-widget-impl';
+import { TerminalWidgetImpl, nextTerminalCreationToken } from '@theia/terminal/lib/browser/terminal-widget-impl';
 import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { TerminalFrontendContribution } from '@theia/terminal/lib/browser/terminal-frontend-contribution';
 import { TerminalManagerPreferences } from './terminal-manager-preferences';
@@ -78,9 +79,12 @@ export namespace TerminalManagerWidgetState {
 }
 
 @injectable()
-export class TerminalManagerWidget extends BaseWidget implements StatefulWidget, ApplicationShell.TrackableWidgetProvider {
+export class TerminalManagerWidget extends BaseWidget implements StatefulWidget, ApplicationShell.TrackableWidgetProvider, ExtractableWidget {
     static ID = 'terminal-manager-widget';
     static LABEL = nls.localize('theia/terminal-manager/label', 'Terminals');
+
+    isExtractable: boolean = true;
+    secondaryWindow: Window | undefined;
 
     protected panel: SplitPanel;
     protected pageAndTreeLayout: SplitLayout | undefined;
@@ -163,33 +167,13 @@ export class TerminalManagerWidget extends BaseWidget implements StatefulWidget,
         }
     }
 
-    /**
-     * Incremented while {@link createTerminalWidget} is executing, so that external
-     * listeners can distinguish internally created terminals from external ones (e.g. from plugins).
-     * Uses a counter instead of a boolean to handle concurrent calls correctly.
-     */
-    private _creatingTerminalInternallyCount = 0;
-
-    get creatingTerminalInternally(): boolean {
-        return this._creatingTerminalInternallyCount > 0;
-    }
-
     async createTerminalWidget(options: TerminalWidgetOptions = {}): Promise<TerminalWidget> {
-        this._creatingTerminalInternallyCount++;
-        try {
-            const terminalWidget = await this.terminalFrontendContribution.newTerminal({
-                // passing 'created' here as a millisecond value rather than the default `new Date().toString()` that Theia uses in
-                // its factory (resolves to something like 'Tue Aug 09 2022 13:21:26 GMT-0500 (Central Daylight Time)').
-                // The state restoration system relies on identifying terminals by their unique options, using an ms value ensures we don't
-                // get a duplication since the original date method is only accurate to within 1s.
-                created: new Date().getTime().toString(),
-                ...options,
-            } as TerminalWidgetOptions);
-            terminalWidget.start();
-            return terminalWidget;
-        } finally {
-            this._creatingTerminalInternallyCount--;
-        }
+        const terminalWidget = await this.terminalFrontendContribution.newTerminal({
+            created: nextTerminalCreationToken(),
+            ...options,
+        } as TerminalWidgetOptions);
+        terminalWidget.start();
+        return terminalWidget;
     }
 
     protected registerListeners(): void {
@@ -299,6 +283,8 @@ export class TerminalManagerWidget extends BaseWidget implements StatefulWidget,
 
     protected async confirmClose(): Promise<boolean> {
         const CLOSE = nls.localizeByDefault('Close');
+        // When the widget lives in a secondary window, open the dialog there so it is visible to the user.
+        const dialogOptions = this.secondaryWindow ? { node: this.secondaryWindow.document.createElement('div') } : undefined;
         const dialog = new ConfirmDialog({
             title: nls.localize('theia/terminal-manager/closeDialog/title', 'Do you want to close the terminal manager?'),
             msg: nls.localize(
@@ -307,26 +293,25 @@ export class TerminalManagerWidget extends BaseWidget implements StatefulWidget,
             ),
             ok: CLOSE,
             cancel: nls.localizeByDefault('Cancel'),
-        });
+        }, dialogOptions);
         const confirmed = await dialog.open();
         return confirmed === true;
     }
 
-    addTerminalPage(widget: Widget): void {
-        this.doAddTerminalPage(widget);
-    }
-
-    protected doAddTerminalPage(widget: Widget): TerminalManagerTreeTypes.PageSplitPanel | undefined {
+    /**
+     * Add a terminal to a page. If no `pageId` is given, a new auto-numbered
+     * page is created. If a `pageId` is given, the existing page is reused
+     * or a new one is created (with special-page config applied if available).
+     */
+    addTerminalPage(widget: Widget, pageId?: TerminalManagerTreeTypes.PageId): void {
         if (widget instanceof TerminalWidgetImpl) {
+            const resolvedPageId = pageId ?? this.createPagePanel().id;
             const terminalKey = TerminalManagerTreeTypes.generateTerminalKey(widget);
             this.addTerminalReference(widget, terminalKey);
             this.onDidChangeTrackableWidgetsEmitter.fire(this.getTrackableWidgets());
             const groupPanel = this.createTerminalGroupPanel();
             groupPanel.addWidget(widget);
-            const pagePanel = this.createPagePanel();
-            pagePanel.addWidget(groupPanel);
-            this.treeWidget.model.addTerminalPage(terminalKey, groupPanel.id, pagePanel.id, widget.title.label);
-            return pagePanel;
+            this.treeWidget.model.addTerminalPage(terminalKey, groupPanel.id, resolvedPageId, widget.title.label);
         }
     }
 
@@ -347,6 +332,17 @@ export class TerminalManagerWidget extends BaseWidget implements StatefulWidget,
         };
         widget.title.changed.connect(titleChangeHandler);
         disposables.push(Disposable.create(() => widget.title.changed.disconnect(titleChangeHandler)));
+
+        // When the terminal widget is disposed externally (e.g. debug process
+        // exits), remove its tree node so the manager doesn't show an empty
+        // entry.
+        const onWidgetDisposed = () => {
+            if (this.terminalWidgets.has(nodeId)) {
+                this.deleteTerminal(nodeId);
+            }
+        };
+        widget.disposed.connect(onWidgetDisposed);
+        disposables.push(Disposable.create(() => widget.disposed.disconnect(onWidgetDisposed)));
 
         this.terminalDisposables.set(nodeId, disposables);
     }
@@ -531,17 +527,6 @@ export class TerminalManagerWidget extends BaseWidget implements StatefulWidget,
         }
     }
 
-    addTerminalToTasksPage(widget: Widget): void {
-        if (widget instanceof TerminalWidgetImpl) {
-            const terminalKey = TerminalManagerTreeTypes.generateTerminalKey(widget);
-            this.addTerminalReference(widget, terminalKey);
-            this.onDidChangeTrackableWidgetsEmitter.fire(this.getTrackableWidgets());
-            const groupPanel = this.createTerminalGroupPanel();
-            groupPanel.addWidget(widget);
-            this.treeWidget.model.addTerminalToTasksPage(terminalKey, groupPanel.id, widget.title.label);
-        }
-    }
-
     protected override onActivateRequest(msg: Message): void {
         super.onActivateRequest(msg);
         const activeTerminalId = this.treeWidget.model.activeTerminalNode?.id;
@@ -567,10 +552,12 @@ export class TerminalManagerWidget extends BaseWidget implements StatefulWidget,
 
     protected handleTerminalDeleted(terminalId: TerminalManagerTreeTypes.TerminalKey): void {
         const terminalWidget = this.terminalWidgets.get(terminalId);
+        // Remove the reference before disposing so the disposed-signal
+        // handler does not re-enter deleteTerminal.
+        this.removeTerminalReferenceByNodeId(terminalId);
         if (!terminalWidget?.isDisposed) {
             terminalWidget?.dispose();
         }
-        this.removeTerminalReferenceByNodeId(terminalId);
     }
 
     protected handleOnDidChangeActiveWidget(widget: Widget | null): void {
@@ -653,9 +640,10 @@ export class TerminalManagerWidget extends BaseWidget implements StatefulWidget,
 
     async resetView(): Promise<void> {
         const terminalWidget = await this.createTerminalWidget();
-        const page = this.doAddTerminalPage(terminalWidget);
+        const pagePanel = this.createPagePanel();
+        this.addTerminalPage(terminalWidget, pagePanel.id);
         for (const id of this.pagePanels.keys()) {
-            if (id !== page?.id) {
+            if (id !== pagePanel.id) {
                 this.deletePage(id);
             }
         }

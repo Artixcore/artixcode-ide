@@ -20,9 +20,13 @@ import { ResponseNode } from '@theia/ai-chat-ui/lib/browser/chat-tree-view';
 import { ChatResponseContent, ToolCallChatResponseContent } from '@theia/ai-chat/lib/common';
 import { ReactNode } from '@theia/core/shared/react';
 import * as React from '@theia/core/shared/react';
+import { UntitledResourceResolver } from '@theia/core';
 import { codicon, ContextMenuRenderer, KeybindingRegistry, OpenerService } from '@theia/core/lib/browser';
+import { ClipboardService } from '@theia/core/lib/browser/clipboard-service';
+import { ThemeService } from '@theia/core/lib/browser/theming';
 import { nls } from '@theia/core/lib/common/nls';
-import { useMarkdownRendering } from '@theia/ai-chat-ui/lib/browser/chat-response-renderer/markdown-part-renderer';
+import { MonacoEditorProvider } from '@theia/monaco/lib/browser/monaco-editor-provider';
+import { MarkdownWithMermaid } from '@theia/ai-chat-ui/lib/browser/chat-response-renderer/mermaid-rendering';
 import { ToolConfirmationKeybindingHints, withToolCallConfirmation } from '@theia/ai-chat-ui/lib/browser/chat-response-renderer/tool-confirmation';
 import {
     APPROVE_LATEST_TOOL_CONFIRMATION_COMMAND,
@@ -66,14 +70,20 @@ interface UserInteractionComponentProps {
      */
     onPartialResult: (result: UserInteractionResult) => void;
     openerService: OpenerService;
+    themeService: ThemeService;
+    clipboardService: ClipboardService;
+    editorProvider: MonacoEditorProvider;
+    untitledResourceResolver: UntitledResourceResolver;
 }
 
 const UserInteractionComponent: React.FC<UserInteractionComponentProps> = ({
-    args, toolCallId, tool, finished, canceled, result, onPartialResult, openerService
+    args, toolCallId, tool, finished, canceled, result, onPartialResult, openerService, themeService, clipboardService, editorProvider, untitledResourceResolver
 }) => {
     const steps = args.interactions;
     const stepCount = steps.length;
-    const [currentStep, setCurrentStep] = React.useState(0);
+    // Resume at the step another mount of this interaction left off at (e.g. the collapsed
+    // delegation summary vs. the expanded details render independent components).
+    const [currentStep, setCurrentStep] = React.useState(() => tool.getCurrentStep(toolCallId) ?? 0);
     // The tool's result (partial or final) is the single source of truth for step states.
     const [stepStates, setStepStates] = React.useState<StepState[]>(() => {
         if (result) {
@@ -93,7 +103,6 @@ const UserInteractionComponent: React.FC<UserInteractionComponentProps> = ({
 
     const activeStep: UserInteractionStep | undefined = steps[currentStep];
     const isLastStep = currentStep === stepCount - 1;
-    const messageRef = useMarkdownRendering(activeStep?.message ?? '', openerService);
 
     // A finished tool call has no live handler anymore (completion, cancellation, or
     // restoration of a previously-pending interaction). Lock all inputs in that case.
@@ -114,6 +123,13 @@ const UserInteractionComponent: React.FC<UserInteractionComponentProps> = ({
             }
         }
     }, [currentStep, activeStep, isFinal, tool]);
+
+    // Keep the tool informed of the current step so that a later mount resumes here.
+    React.useEffect(() => {
+        if (!isFinal) {
+            tool.recordCurrentStep(toolCallId, currentStep);
+        }
+    }, [currentStep, isFinal, tool, toolCallId]);
 
     const buildResult = React.useCallback((completed: boolean, states: StepState[]): UserInteractionResult => ({
         completed,
@@ -225,7 +241,7 @@ const UserInteractionComponent: React.FC<UserInteractionComponentProps> = ({
     }
 
     const activeState = stepStates[currentStep];
-    const stepLabel = nls.localize('theia/ai-ide/userInteractionStepLabel', 'Step {0} of {1}', currentStep + 1, stepCount);
+    const stepLabel = nls.localizeByDefault('Step {0} of {1}', currentStep + 1, stepCount);
     const advanceLabel = isLastStep
         ? nls.localize('theia/ai-ide/userInteractionFinishStep', 'Finish')
         : nls.localizeByDefault('Next');
@@ -259,7 +275,7 @@ const UserInteractionComponent: React.FC<UserInteractionComponentProps> = ({
                         return (
                             <span className='user-interaction-tool status canceled'>
                                 <i className={codicon('close')} />
-                                {nls.localize('theia/ai-ide/userInteractionCanceled', 'Canceled')}
+                                {nls.localizeByDefault('Canceled')}
                             </span>
                         );
                     }
@@ -282,7 +298,24 @@ const UserInteractionComponent: React.FC<UserInteractionComponentProps> = ({
                     ))}
                 </div>
             )}
-            <div className='user-interaction-tool message' ref={messageRef} />
+            {/* Render every step's message up front, each in its own keyed container and hidden when inactive.
+                Mounting them all means any Mermaid diagrams render once (while hidden, so they add no layout
+                height) instead of rendering on first navigation to a step. A diagram that renders asynchronously
+                while its step is visible changes the row height a tick later, which makes the virtualized chat
+                scroll and can unmount the interaction; pre-rendering avoids that, and keeping each step mounted
+                also preserves its view state (zoom, source mode, ...) across navigation without bleeding into
+                other steps. */}
+            {steps.map((step, i) =>
+                <div key={i} className='user-interaction-tool message' hidden={i !== currentStep}>
+                    <MarkdownWithMermaid
+                        content={step.message ?? ''}
+                        openerService={openerService}
+                        themeService={themeService}
+                        clipboardService={clipboardService}
+                        editorProvider={editorProvider}
+                        untitledResourceResolver={untitledResourceResolver} />
+                </div>
+            )}
             {hasOptions && (
                 <div className='user-interaction-tool options'>
                     {activeStep.options!.map((option, i) => {
@@ -470,8 +503,13 @@ const MalformedInteraction: React.FC<{ message: string }> = ({ message }) => (
     </div>
 );
 
-interface ToolErrorResult { error: string }
-function parseToolErrorResult(raw: unknown): ToolErrorResult | undefined {
+/**
+ * Extract the message to show for a tool result that the renderer cannot turn into an interaction.
+ * Covers both shapes the tool can produce for malformed arguments: the `{ error }` result of the
+ * handler, and the `{ denied: true, reason }` result of the auto-deny in `checkAutoAction`, which
+ * is what a validation failure produces before the handler ever runs.
+ */
+function extractErrorMessage(raw: unknown): string | undefined {
     let candidate: unknown = raw;
     if (typeof raw === 'string') {
         try {
@@ -480,8 +518,15 @@ function parseToolErrorResult(raw: unknown): ToolErrorResult | undefined {
             return undefined;
         }
     }
-    if (candidate && typeof candidate === 'object' && typeof (candidate as { error?: unknown }).error === 'string') {
-        return candidate as ToolErrorResult;
+    if (!candidate || typeof candidate !== 'object') {
+        return undefined;
+    }
+    const error = (candidate as { error?: unknown }).error;
+    if (typeof error === 'string') {
+        return error;
+    }
+    if (ToolCallChatResponseContent.isDenialResult(candidate) && typeof candidate.reason === 'string') {
+        return candidate.reason;
     }
     return undefined;
 }
@@ -504,6 +549,18 @@ export class UserInteractionToolRenderer implements ChatResponsePartRenderer<Too
     @inject(OpenerService)
     protected openerService: OpenerService;
 
+    @inject(ThemeService)
+    protected themeService: ThemeService;
+
+    @inject(ClipboardService)
+    protected clipboardService: ClipboardService;
+
+    @inject(MonacoEditorProvider)
+    protected editorProvider: MonacoEditorProvider;
+
+    @inject(UntitledResourceResolver)
+    protected untitledResourceResolver: UntitledResourceResolver;
+
     @inject(PendingToolConfirmationTracker)
     protected pendingToolConfirmationTracker: PendingToolConfirmationTracker;
 
@@ -517,8 +574,18 @@ export class UserInteractionToolRenderer implements ChatResponsePartRenderer<Too
         return -1;
     }
 
+    /**
+     * The regular rendering of this tool already is the interactive UI, so reuse it
+     * where only the pending interaction should be shown (e.g. on the collapsed
+     * summary of a delegated session, see #17952).
+     */
+    renderConfirmation(response: ToolCallChatResponseContent, parentNode: ResponseNode): ReactNode {
+        return this.render(response, parentNode);
+    }
+
     render(response: ToolCallChatResponseContent, parentNode: ResponseNode): ReactNode {
-        const args = parseUserInteractionArgs(response.arguments);
+        const validation = parseUserInteractionArgs(response.arguments);
+        const args = validation.ok ? validation.args : undefined;
 
         if (!args || !response.id) {
             // The tool already returned a result but the args don't validate: this
@@ -526,8 +593,7 @@ export class UserInteractionToolRenderer implements ChatResponsePartRenderer<Too
             // rejected, or arguments that fail shared parsing). Show an error state
             // instead of a perpetual loading spinner.
             if (response.result !== undefined) {
-                const error = parseToolErrorResult(response.result);
-                const message = error?.error
+                const message = extractErrorMessage(response.result)
                     ?? nls.localize('theia/ai-ide/userInteractionMalformedFallback', 'The arguments could not be parsed.');
                 return <MalformedInteraction message={message} />;
             }
@@ -554,6 +620,10 @@ export class UserInteractionToolRenderer implements ChatResponsePartRenderer<Too
                     response.updateResult(JSON.stringify(partial));
                 }}
                 openerService={this.openerService}
+                themeService={this.themeService}
+                clipboardService={this.clipboardService}
+                editorProvider={this.editorProvider}
+                untitledResourceResolver={this.untitledResourceResolver}
                 toolConfirmation={{
                     response,
                     confirmationMode,

@@ -40,6 +40,22 @@ describe('condenseArguments', () => {
         expect(condenseArguments('{invalid}')).to.equal('{invalid}');
     });
 
+    it('returns the raw string without attempting JSON.parse while an arguments object is still streaming', () => {
+        const originalParse = JSON.parse;
+        let parseCalls = 0;
+        JSON.parse = ((text: string, reviver?: Parameters<typeof originalParse>[1]) => {
+            parseCalls++;
+            return originalParse(text, reviver);
+        }) as typeof JSON.parse;
+        try {
+            const streaming = '{"path": "src/index.ts", "content": "partial';
+            expect(condenseArguments(streaming)).to.equal(streaming);
+            expect(parseCalls).to.equal(0);
+        } finally {
+            JSON.parse = originalParse;
+        }
+    });
+
     it('condenses single string parameter as value only', () => {
         const result = condenseArguments('{"query": "search term"}');
         expect(result).to.equal('search term');
@@ -66,8 +82,13 @@ describe('condenseArguments', () => {
         expect(result).to.equal('{\u2026}');
     });
 
-    it('shows [\u2026] for single array param', () => {
+    it('renders primitive array values inline for single array param', () => {
         const result = condenseArguments('{"items": [1, 2, 3]}');
+        expect(result).to.equal('1, 2, 3');
+    });
+
+    it('still shows [\u2026] for arrays containing objects', () => {
+        const result = condenseArguments('{"items": [{"a": 1}, {"b": 2}]}');
         expect(result).to.equal('[\u2026]');
     });
 

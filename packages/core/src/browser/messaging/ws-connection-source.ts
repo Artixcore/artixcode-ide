@@ -14,6 +14,10 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0
 // *****************************************************************************
 
+// Manages the socket the frontend logger's RPC rides on, so logging through an ILogger here
+// would be circular.
+/* eslint-disable @theia/named-logger-check */
+
 import { Emitter, Event } from '../../common/event';
 import { ConnectionSource } from './connection-source';
 import { Socket, io } from 'socket.io-client';
@@ -208,12 +212,7 @@ export class WebSocketConnectionSource implements ConnectionSource {
             reconnection: true,
             reconnectionDelay: 1000,
             reconnectionDelayMax: 10000,
-            reconnectionAttempts: Infinity,
-            extraHeaders: {
-                // Socket.io strips the `origin` header
-                // We need to provide our own for validation
-                'fix-origin': window.location.origin
-            }
+            reconnectionAttempts: Infinity
         });
     }
 
