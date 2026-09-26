@@ -3,7 +3,7 @@
 <div id="artixcode-logo" align="center">
     <br />
     <img src="https://artixcode.com/artixcode-logo.svg" alt="ArtixCode Logo" width="220"/>
-    <h1>ArtixCode IDE</h1>
+    <h1>Artixcode IDE</h1>
     <h3>AI-Native Cloud & Desktop IDE for Coding, Debugging, Audit, and Safe Patch Workflows</h3>
 </div>
 
