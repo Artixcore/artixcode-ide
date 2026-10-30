@@ -15,13 +15,18 @@
 // *****************************************************************************
 
 import { expect } from 'chai';
+import * as sinon from 'sinon';
 import {
-    CompactionMessage, isCompactionResponsePart, isServerToolCallResponsePart, isTextResponsePart, isThinkingResponsePart, isUsageResponsePart,
-    LanguageModelMessage, LanguageModelResponse, LanguageModelStreamResponsePart, UserRequest
+    CompactionMessage, isCompactionResponsePart, isServerToolCallResponsePart, isTextResponsePart, isThinkingResponsePart, isToolCallResponsePart,
+    isUsageResponsePart, LanguageModelMessage, LanguageModelResponse, LanguageModelStreamResponsePart, ToolCallExecutor, ToolCallExecutorImpl, UserRequest
 } from '@theia/ai-core';
-import { OpenAiModelUtils } from './openai-language-model';
+import { ILogger } from '@theia/core';
+import { Container } from '@theia/core/shared/inversify';
 import { MockLogger } from '@theia/core/lib/common/test/mock-logger';
+import { Deferred } from '@theia/core/lib/common/promise-util';
+import { OpenAiModelUtils } from './openai-model-utils';
 import { OpenAI } from 'openai';
+import type { ResponseStreamEvent } from 'openai/resources/responses/responses';
 import { OPENAI_FUNCTION_CALL_REASONING_DATA_KEY, OpenAiResponseApiUtils } from './openai-response-api-utils';
 import { OPENAI_WEB_SEARCH, OPENAI_WEB_SEARCH_REPLAY_DATA_KEY } from './openai-server-tools';
 
@@ -31,10 +36,22 @@ async function* toStream(events: unknown[]): AsyncIterable<unknown> {
     }
 }
 
+function outputItemEvents(item: Record<string, unknown>, outputIndex: number): unknown[] {
+    return [
+        { type: 'response.output_item.added', output_index: outputIndex, item: item.type === 'function_call' ? { ...item, arguments: '' } : item },
+        ...(item.type === 'function_call' ? [{
+            type: 'response.function_call_arguments.done', item_id: item.id, name: item.name, arguments: item.arguments
+        }] : []),
+        { type: 'response.output_item.done', output_index: outputIndex, item }
+    ];
+}
+
 function createTestUtils(): OpenAiResponseApiUtils {
-    const utils = new OpenAiResponseApiUtils();
-    (utils as unknown as { logger: MockLogger }).logger = new MockLogger();
-    return utils;
+    const container = new Container();
+    container.bind(ILogger).to(MockLogger);
+    container.bind(ToolCallExecutor).to(ToolCallExecutorImpl).inSingletonScope();
+    container.bind(OpenAiResponseApiUtils).toSelf();
+    return container.get(OpenAiResponseApiUtils);
 }
 
 describe('OpenAiResponseApiUtils', () => {
@@ -94,19 +111,99 @@ describe('OpenAiResponseApiUtils', () => {
         expect(tools?.map(tool => tool.type)).to.deep.equal(['function', 'tool_search', 'web_search']);
     });
 
+    it('preserves required output fields when serializing historical empty tool results', () => {
+        const messages: LanguageModelMessage[] = [
+            { actor: 'user', type: 'tool_result', tool_use_id: 'missing', name: 'lookup' },
+            { actor: 'user', type: 'tool_result', tool_use_id: 'undefined', name: 'lookup', content: undefined },
+            { actor: 'user', type: 'tool_result', tool_use_id: 'empty', name: 'lookup', content: '' },
+            { actor: 'user', type: 'tool_result', tool_use_id: 'text', name: 'lookup', content: 'result' },
+            { actor: 'user', type: 'tool_result', tool_use_id: 'object', name: 'lookup', content: { value: 1 } },
+            { actor: 'user', type: 'tool_result', tool_use_id: 'to-json', name: 'lookup', content: { toJSON: () => undefined } }
+        ];
+        const { input } = utils.processMessages(messages, 'developer', 'gpt-5');
+
+        // Assert the wire representation: JSON serialization must not drop the required output property.
+        expect(JSON.parse(JSON.stringify(input))).to.deep.equal([
+            { type: 'function_call_output', call_id: 'missing', output: '' },
+            { type: 'function_call_output', call_id: 'undefined', output: '' },
+            { type: 'function_call_output', call_id: 'empty', output: '' },
+            { type: 'function_call_output', call_id: 'text', output: 'result' },
+            { type: 'function_call_output', call_id: 'object', output: '{"value":1}' },
+            { type: 'function_call_output', call_id: 'to-json', output: '' }
+        ]);
+    });
+
+    for (const isStreaming of [true, false]) {
+        it(`emits one output per tool call including empty results (${isStreaming ? 'streaming' : 'non-streaming'})`, async () => {
+            const functionCalls = ['void', 'empty', 'object', 'to-json', 'failed', 'missing'].map((name, index) => ({
+                id: `item-${index}`,
+                call_id: `call-${index}`,
+                type: 'function_call',
+                name,
+                arguments: '{}'
+            }));
+            const payloads: Record<string, unknown>[] = [];
+            const recordRequest = (payload: Record<string, unknown>): void => {
+                payloads.push(JSON.parse(JSON.stringify(payload)));
+            };
+            const openai = {
+                responses: {
+                    stream: (payload: Record<string, unknown>) => {
+                        recordRequest(payload);
+                        return toStream(payloads.length === 1
+                            ? functionCalls.flatMap((item, index) => outputItemEvents(item, index))
+                            : [{ type: 'response.output_text.delta', delta: 'done' }]);
+                    },
+                    create: async (payload: Record<string, unknown>) => {
+                        recordRequest(payload);
+                        return { output: payloads.length === 1 ? functionCalls : [], output_text: payloads.length === 1 ? '' : 'done' };
+                    }
+                }
+            };
+            const request: UserRequest = {
+                sessionId: 'session-1',
+                requestId: 'request-1',
+                messages: [{ actor: 'user', type: 'text', text: 'hello' }],
+                tools: [
+                    { id: 'void', name: 'void', parameters: { type: 'object', properties: {} }, handler: async () => undefined },
+                    { id: 'empty', name: 'empty', parameters: { type: 'object', properties: {} }, handler: async () => '' },
+                    { id: 'object', name: 'object', parameters: { type: 'object', properties: {} }, handler: async () => ({ value: 1 }) },
+                    { id: 'to-json', name: 'to-json', parameters: { type: 'object', properties: {} }, handler: async () => ({ toJSON: () => undefined }) },
+                    { id: 'failed', name: 'failed', parameters: { type: 'object', properties: {} }, handler: async () => { throw new Error('failed'); } }
+                ]
+            };
+            const response = await utils.handleRequest(
+                openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer', 'openai/gpt-5', isStreaming
+            );
+            if (!('stream' in response)) {
+                throw new Error('Expected the tool loop to return a stream');
+            }
+            const parts: LanguageModelStreamResponsePart[] = [];
+            for await (const part of response.stream) {
+                parts.push(part);
+            }
+
+            expect(parts.filter(isTextResponsePart)).to.deep.equal([{ content: 'done' }]);
+            expect(payloads).to.have.length(2);
+            const input = payloads[1].input as { type?: string; call_id?: string; output?: string }[];
+            expect(input.filter(item => item.type === 'function_call')).to.deep.equal(functionCalls);
+            expect(input.filter(item => item.type === 'function_call_output')).to.deep.equal([
+                { type: 'function_call_output', call_id: 'call-0', output: '' },
+                { type: 'function_call_output', call_id: 'call-1', output: '' },
+                { type: 'function_call_output', call_id: 'call-2', output: '{"value":1}' },
+                { type: 'function_call_output', call_id: 'call-3', output: '' },
+                { type: 'function_call_output', call_id: 'call-4', output: 'Error: failed' },
+                { type: 'function_call_output', call_id: 'call-5', output: 'Error: Tool missing not found' }
+            ]);
+        });
+    }
+
     it('emits per-iteration usage for Response API tool calls instead of accumulated usage', async () => {
         const streams = [
             [
-                {
-                    type: 'response.output_item.added',
-                    item: {
-                        id: 'item-1',
-                        call_id: 'call-1',
-                        type: 'function_call',
-                        name: 'lookup',
-                        arguments: '{"query":"test"}'
-                    }
-                },
+                ...outputItemEvents({
+                    id: 'item-1', call_id: 'call-1', type: 'function_call', name: 'lookup', arguments: '{"query":"test"}'
+                }, 0),
                 {
                     type: 'response.completed',
                     response: {
@@ -162,7 +259,6 @@ describe('OpenAiResponseApiUtils', () => {
             'gpt-5',
             new OpenAiModelUtils(),
             'developer',
-            { maxChatCompletions: 3 },
             'openai/gpt-5',
             true
         );
@@ -193,12 +289,9 @@ describe('OpenAiResponseApiUtils', () => {
         };
         const streams = [
             [
-                { type: 'response.output_item.done', item: reasoningItem },
-                { type: 'response.output_item.done', item: searchCall },
-                {
-                    type: 'response.output_item.added',
-                    item: { id: 'item-1', call_id: 'call-1', type: 'function_call', name: 'lookup', arguments: '{"query":"test"}' }
-                }
+                ...outputItemEvents(reasoningItem, 0),
+                ...outputItemEvents(searchCall, 1),
+                ...outputItemEvents({ id: 'item-1', call_id: 'call-1', type: 'function_call', name: 'lookup', arguments: '{"query":"test"}' }, 2)
             ],
             [{ type: 'response.output_text.delta', delta: 'done' }]
         ];
@@ -226,7 +319,7 @@ describe('OpenAiResponseApiUtils', () => {
 
         const response = await utils.handleRequest(
             openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer',
-            { maxChatCompletions: 3 }, 'openai/gpt-5', true
+            'openai/gpt-5', true
         );
         const parts: LanguageModelStreamResponsePart[] = [];
         if ('stream' in response) {
@@ -243,71 +336,78 @@ describe('OpenAiResponseApiUtils', () => {
         expect(input.indexOf(reasoningItem)).to.be.lessThan(input.indexOf(searchCall));
     });
 
-    it('yields a compaction part when the stream contains a response.output_item.done compaction event', async () => {
-        const streamEvents = [
-            {
-                type: 'response.output_item.done',
-                item: { type: 'compaction', id: 'c1', encrypted_content: 'enc1' }
-            } as never,
-            {
-                type: 'response.completed',
-                response: { usage: { input_tokens: 10, output_tokens: 5 } }
-            } as never
-        ];
-        const openai = {
-            responses: {
-                stream: () => toStream(streamEvents)
-            }
-        };
-        const request: UserRequest = {
-            sessionId: 'session-1',
-            requestId: 'request-1',
-            messages: [{ actor: 'user', type: 'text', text: 'hello' }]
-        };
+    for (const withTools of [false, true]) {
+        it(`emits and replays OpenAI compaction ${withTools ? 'with client tools' : 'without tools'}`, async () => {
+            const payloads: Record<string, unknown>[] = [];
+            const openai = {
+                responses: {
+                    stream: (payload: Record<string, unknown>) => {
+                        payloads.push(payload);
+                        return toStream(payloads.length === 1 ? [
+                            { type: 'response.output_item.done', output_index: 0, item: { type: 'compaction', id: 'c1', encrypted_content: 'enc1' } },
+                            { type: 'response.completed', response: { usage: { input_tokens: 10, output_tokens: 5 } } }
+                        ] : [{ type: 'response.output_text.delta', delta: 'Continued answer' }]);
+                    }
+                }
+            };
+            const request: UserRequest = {
+                sessionId: 'session-1',
+                requestId: 'request-1',
+                messages: [{ actor: 'user', type: 'text', text: 'hello' }],
+                tools: withTools ? [{ id: 'lookup', name: 'lookup', parameters: { type: 'object', properties: {} }, handler: async () => 'result' }] : undefined
+            };
 
-        const response = await utils.handleRequest(
-            openai as never,
-            request,
-            {},
-            'gpt-5',
-            new OpenAiModelUtils(),
-            'developer',
-            { maxChatCompletions: 3 },
-            'openai/gpt-5',
-            true
-        );
-        const parts: LanguageModelStreamResponsePart[] = [];
-        if ('stream' in response) {
-            for await (const part of response.stream) {
-                parts.push(part);
+            const response = await utils.handleRequest(
+                openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer', 'openai/gpt-5', true
+            );
+            const parts: LanguageModelStreamResponsePart[] = [];
+            expect('stream' in response).to.equal(true);
+            if ('stream' in response) {
+                for await (const part of response.stream) {
+                    parts.push(part);
+                }
             }
-        }
 
-        const compactionParts = parts.filter(isCompactionResponsePart);
-        expect(compactionParts).to.have.length(1);
-        expect(compactionParts[0]).to.deep.equal({
-            compaction: {
-                provider: 'openai-responses',
-                data: { id: 'c1', encrypted_content: 'enc1' }
+            const compactionParts = parts.filter(isCompactionResponsePart);
+            expect(compactionParts).to.deep.equal([{
+                compaction: { provider: 'openai-responses', data: { id: 'c1', encrypted_content: 'enc1' } }
+            }]);
+            const replayRequest: UserRequest = {
+                ...request,
+                messages: [
+                    ...request.messages,
+                    { actor: 'ai', type: 'compaction', ...compactionParts[0].compaction },
+                    { actor: 'user', type: 'text', text: 'Next turn' }
+                ]
+            };
+            const replay = await utils.handleRequest(
+                openai as never, replayRequest, {}, 'gpt-5', new OpenAiModelUtils(), 'developer', 'openai/gpt-5', true
+            );
+            const replayParts: LanguageModelStreamResponsePart[] = [];
+            expect('stream' in replay).to.equal(true);
+            if ('stream' in replay) {
+                for await (const part of replay.stream) {
+                    replayParts.push(part);
+                }
             }
+            expect(replayParts.filter(isTextResponsePart)).to.deep.equal([{ content: 'Continued answer' }]);
+            expect(payloads).to.have.lengthOf(2);
+            expect(payloads[1].input).to.deep.equal([
+                { type: 'compaction', id: 'c1', encrypted_content: 'enc1' },
+                { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Next turn' }] }
+            ]);
         });
-    });
+    }
 
-    it('surfaces the deferred-tool search as a running then finished server tool call', async () => {
+    it('surfaces and replays the native deferred-tool search output', async () => {
+        const searchCall = { id: 'ts-item-1', call_id: 'ts-1', type: 'tool_search_call', execution: 'server', status: 'completed', arguments: { query: 'file' } };
+        const searchOutput = { id: 'ts-out-1', call_id: 'ts-1', type: 'tool_search_output', execution: 'server', status: 'completed', tools: [{}, {}] };
+        const functionCall = { id: 'item-1', call_id: 'call-1', type: 'function_call', name: 'lookup', arguments: '{"query":"test"}' };
         const streams = [
             [
-                {
-                    type: 'response.output_item.added',
-                    item: { id: 'ts-item-1', call_id: 'ts-1', type: 'tool_search_call', execution: 'server', status: 'in_progress', arguments: { query: 'file' } }
-                },
-                {
-                    type: 'response.output_item.done',
-                    item: { id: 'ts-out-1', call_id: 'ts-1', type: 'tool_search_output', execution: 'server', status: 'completed', tools: [{}, {}] }
-                },
-                {
-                    type: 'response.output_item.added',
-                    item: { id: 'item-1', call_id: 'call-1', type: 'function_call', name: 'lookup', arguments: '{"query":"test"}' }
-                },
+                ...outputItemEvents(searchCall, 0),
+                ...outputItemEvents(searchOutput, 1),
+                ...outputItemEvents(functionCall, 2),
                 { type: 'response.completed', response: { usage: { input_tokens: 100, output_tokens: 10 } } }
             ],
             [
@@ -315,9 +415,13 @@ describe('OpenAiResponseApiUtils', () => {
                 { type: 'response.completed', response: { usage: { input_tokens: 200, output_tokens: 20 } } }
             ]
         ];
+        const payloads: Record<string, unknown>[] = [];
         const openai = {
             responses: {
-                stream: () => toStream(streams.shift() ?? [])
+                stream: (payload: Record<string, unknown>) => {
+                    payloads.push(payload);
+                    return toStream(streams.shift() ?? []);
+                }
             }
         };
         const request: UserRequest = {
@@ -340,7 +444,6 @@ describe('OpenAiResponseApiUtils', () => {
             'gpt-5',
             new OpenAiModelUtils(),
             'developer',
-            { maxChatCompletions: 3 },
             'openai/gpt-5',
             true
         );
@@ -362,6 +465,10 @@ describe('OpenAiResponseApiUtils', () => {
         expect(finished!.id).to.equal('ts-1');
         expect(finished!.name).to.equal('tool_search');
         expect(finished!.result).to.deep.equal({ content: [{ type: 'text', text: 'Found 2 tools.' }] });
+        expect(payloads[1].input).to.deep.equal([
+            ...payloads[0].input as unknown[], searchCall, searchOutput, functionCall,
+            { type: 'function_call_output', call_id: 'call-1', output: 'result' }
+        ]);
     });
 
     it('surfaces web search as a running then finished server tool call', async () => {
@@ -380,9 +487,9 @@ describe('OpenAiResponseApiUtils', () => {
         const openai = {
             responses: {
                 stream: () => toStream([
-                    { type: 'response.output_item.done', item: reasoningItem },
-                    { type: 'response.output_item.added', item: { ...searchCall, status: 'in_progress' } },
-                    { type: 'response.output_item.done', item: searchCall },
+                    { type: 'response.output_item.done', output_index: 0, item: reasoningItem },
+                    { type: 'response.output_item.added', output_index: 1, item: { ...searchCall, status: 'in_progress' } },
+                    { type: 'response.output_item.done', output_index: 1, item: searchCall },
                     { type: 'response.output_text.delta', delta: 'Latest news.' },
                     { type: 'response.completed', response: { usage: { input_tokens: 10, output_tokens: 5 } } }
                 ])
@@ -397,7 +504,7 @@ describe('OpenAiResponseApiUtils', () => {
 
         const response = await utils.handleRequest(
             openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer',
-            { maxChatCompletions: 3 }, 'openai/gpt-5', true
+            'openai/gpt-5', true
         );
         const parts: LanguageModelStreamResponsePart[] = [];
         if ('stream' in response) {
@@ -438,7 +545,7 @@ describe('OpenAiResponseApiUtils', () => {
 
         const response = await utils.handleRequest(
             openai as never, request, { include: ['file_search_call.results', 'web_search_call.action.sources'] },
-            'gpt-5', new OpenAiModelUtils(), 'developer', { maxChatCompletions: 3 }, 'openai/gpt-5', false
+            'gpt-5', new OpenAiModelUtils(), 'developer', 'openai/gpt-5', false
         );
         const parts: LanguageModelStreamResponsePart[] = [];
         if ('stream' in response) {
@@ -495,8 +602,8 @@ describe('OpenAiResponseApiUtils', () => {
         const requests: Record<string, unknown>[] = [];
         const streams = [
             [
-                { type: 'response.output_item.done', item: reasoningItem },
-                { type: 'response.output_item.added', item: functionCall }
+                ...outputItemEvents(reasoningItem, 0),
+                ...outputItemEvents(functionCall, 1)
             ],
             [{ type: 'response.output_text.delta', delta: 'done' }]
         ];
@@ -522,7 +629,7 @@ describe('OpenAiResponseApiUtils', () => {
 
         const response = await utils.handleRequest(
             openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer',
-            { maxChatCompletions: 3 }, 'openai/gpt-5', true
+            'openai/gpt-5', true
         );
         const parts: LanguageModelStreamResponsePart[] = [];
         if ('stream' in response) {
@@ -595,7 +702,7 @@ describe('OpenAiResponseApiUtils', () => {
 
             const parts = await drain(await utils.handleRequest(
                 openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer',
-                { maxChatCompletions: 3 }, 'openai/gpt-5', true
+                'openai/gpt-5', true
             ));
 
             expect(thoughts(parts)).to.equal('Weighing options\n\nDeciding');
@@ -607,9 +714,14 @@ describe('OpenAiResponseApiUtils', () => {
                 [
                     ...summaryEvents,
                     {
-                        type: 'response.output_item.added',
-                        item: { id: 'item-1', call_id: 'call-1', type: 'function_call', name: 'lookup', arguments: '{}' }
-                    }
+                        type: 'response.output_item.done', output_index: 0,
+                        item: {
+                            id: 'rs-1', type: 'reasoning', summary: [
+                                { type: 'summary_text', text: 'Weighing options' }, { type: 'summary_text', text: 'Deciding' }
+                            ], encrypted_content: 'encrypted-reasoning'
+                        }
+                    },
+                    ...outputItemEvents({ id: 'item-1', call_id: 'call-1', type: 'function_call', name: 'lookup', arguments: '{}' }, 1)
                 ],
                 [{ type: 'response.output_text.delta', delta: 'done' }]
             ];
@@ -632,7 +744,7 @@ describe('OpenAiResponseApiUtils', () => {
 
             const parts = await drain(await utils.handleRequest(
                 openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer',
-                { maxChatCompletions: 3 }, 'openai/gpt-5', true
+                'openai/gpt-5', true
             ));
 
             expect(thoughts(parts)).to.equal('Weighing options\n\nDeciding');
@@ -673,7 +785,7 @@ describe('OpenAiResponseApiUtils', () => {
                 };
                 const send = async () => drain(await utils.handleRequest(
                     openai as never, request, summarySettings, 'gpt-5', new OpenAiModelUtils(), 'developer',
-                    { maxChatCompletions: 3 }, 'openai/gpt-5', true
+                    'openai/gpt-5', true
                 ));
 
                 const parts = await send();
@@ -704,7 +816,7 @@ describe('OpenAiResponseApiUtils', () => {
 
                 const parts = await drain(await utils.handleRequest(
                     openai as never, toolRequest, summarySettings, 'gpt-5', new OpenAiModelUtils(), 'developer',
-                    { maxChatCompletions: 3 }, 'openai/gpt-5', false
+                    'openai/gpt-5', false
                 ));
 
                 expect(parts.filter(isTextResponsePart).map(part => part.content).join('')).to.equal('done');
@@ -726,7 +838,7 @@ describe('OpenAiResponseApiUtils', () => {
                 try {
                     await utils.handleRequest(
                         openai as never, request, summarySettings, 'gpt-5', new OpenAiModelUtils(), 'developer',
-                        { maxChatCompletions: 3 }, 'openai/gpt-5', false
+                        'openai/gpt-5', false
                     );
                 } catch (e) {
                     error = e;
@@ -736,6 +848,109 @@ describe('OpenAiResponseApiUtils', () => {
                 expect(calls).to.equal(1);
             });
         });
+    });
+
+    describe('native output replay within a tool loop', () => {
+        const compaction = { type: 'compaction', id: 'cmp-latest', encrypted_content: 'encrypted' };
+        const reasoning = { type: 'reasoning', id: 'reasoning', summary: [], encrypted_content: 'reasoning-data' };
+        const search = { type: 'web_search_call', id: 'search', status: 'completed', action: { type: 'search', query: 'test' } };
+        const message = (text: string) => ({
+            type: 'message', id: `msg-${text}`, role: 'assistant', status: 'completed',
+            content: [{ type: 'output_text', text, annotations: [] }]
+        });
+        const call = (id: string) => ({ type: 'function_call', id: `item-${id}`, call_id: id, name: 'lookup', arguments: '{"query":"test"}' });
+        const callA = call('a');
+        const callB = call('b');
+        const suffix = [reasoning, search, message('after'), callB];
+        const cases = [
+            { name: 'without compaction', output: [callA, ...suffix], replay: [callA, ...suffix] },
+            { name: 'with compaction before calls', output: [message('before'), compaction, callA, ...suffix], replay: [compaction, callA, ...suffix] },
+            { name: 'with compaction between calls', output: [callA, message('before'), compaction, ...suffix], replay: [compaction, ...suffix] },
+            { name: 'with compaction after calls', output: [callA, ...suffix, compaction], replay: [compaction] },
+            {
+                name: 'with output requiring SDK conversion',
+                output: [{ ...callA, created_by: 'provider' }, { type: 'additional_tools', id: 'tools', role: 'assistant', tools: [] }, ...suffix],
+                replay: [callA, ...suffix]
+            },
+            {
+                name: 'with multiple compactions',
+                output: [{ ...compaction, id: 'cmp-old' }, callA, { ...reasoning, id: 'reasoning-before' },
+                { ...search, id: 'search-before' }, message('before'), compaction, ...suffix],
+                replay: [compaction, ...suffix]
+            }
+        ];
+
+        for (const isStreaming of [true, false]) {
+            for (const { name, output, replay } of cases) {
+                it(`replays input ${name} and paired tool results (${isStreaming ? 'streaming' : 'non-streaming'})`, async () => {
+                    const payloads: Record<string, unknown>[] = [];
+                    let executions = 0;
+                    const responses = [output, [call('c')], [message('done')]];
+                    const nextOutput = (payload: Record<string, unknown>) => {
+                        payloads.push(JSON.parse(JSON.stringify(payload)));
+                        return responses.shift() ?? [];
+                    };
+                    const openai = {
+                        responses: {
+                            stream: (payload: Record<string, unknown>) => {
+                                const items = nextOutput(payload);
+                                return toStream([
+                                    ...items.flatMap((item, output_index) => [
+                                        { type: 'response.output_item.added', output_index, item },
+                                        ...(item.type === 'function_call' ? [{
+                                            type: 'response.function_call_arguments.done', item_id: item.id, name: 'lookup', arguments: '{"query":"test"}'
+                                        }] : [])
+                                    ]),
+                                    // Completion arrival order must not change replay order.
+                                    ...items.map((item, output_index) => ({ type: 'response.output_item.done', output_index, item })).reverse(),
+                                    { type: 'response.completed', response: { usage: { input_tokens: 10, output_tokens: 5 } } }
+                                ]);
+                            },
+                            create: async (payload: Record<string, unknown>) => ({ output: nextOutput(payload), output_text: '' })
+                        }
+                    };
+                    const request: UserRequest = {
+                        sessionId: 'session', requestId: 'request',
+                        messages: [
+                            { actor: 'system', type: 'text', text: 'Instructions' },
+                            { actor: 'user', type: 'text', text: 'Old history' }
+                        ],
+                        tools: [{
+                            id: 'lookup', name: 'lookup', parameters: { type: 'object', properties: {} },
+                            handler: async () => { executions++; return executions === 2 ? undefined : 'result'; }
+                        }]
+                    };
+                    const response = await utils.handleRequest(
+                        openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer', 'openai/gpt-5', isStreaming
+                    );
+                    if (!('stream' in response)) {
+                        throw new Error('Expected the tool loop to return a stream');
+                    }
+                    const parts: LanguageModelStreamResponsePart[] = [];
+                    for await (const part of response.stream) {
+                        parts.push(part);
+                    }
+
+                    expect(executions).to.equal(3);
+                    expect(parts.filter(isCompactionResponsePart).map(part => part.compaction.data)).to.have.deep.members(
+                        output.filter(item => item.type === 'compaction').map(item => ({ id: item.id, encrypted_content: 'encrypted' }))
+                    );
+                    expect(payloads).to.have.lengthOf(3);
+                    expect(payloads[1].instructions).to.equal('Instructions');
+                    expect(payloads[1].input).to.deep.equal([
+                        ...(output.some(item => item.type === 'compaction') ? [] : payloads[0].input as unknown[]),
+                        ...replay,
+                        { type: 'function_call_output', call_id: 'a', output: 'result' },
+                        { type: 'function_call_output', call_id: 'b', output: '' }
+                    ]);
+                    expect(payloads[2].input).to.deep.equal([
+                        ...payloads[1].input as unknown[],
+                        call('c'),
+                        { type: 'function_call_output', call_id: 'c', output: 'result' }
+                    ]);
+                });
+            }
+        }
     });
 
     describe('processMessages server-side compaction replay', () => {
@@ -786,8 +1001,10 @@ describe('OpenAiResponseApiUtils', () => {
             const messages: LanguageModelMessage[] = [
                 userMessage('user A'),
                 compactionMessage('openai-responses', 'enc1'),
+                compactionMessage('chatgpt-responses', 'foreign1'),
                 userMessage('user B'),
                 compactionMessage('openai-responses', 'enc2'),
+                compactionMessage('chatgpt-responses', 'foreign2'),
                 userMessage('user C')
             ];
 
@@ -802,12 +1019,13 @@ describe('OpenAiResponseApiUtils', () => {
             expect(serialized).to.not.contain('user A');
             expect(serialized).to.not.contain('user B');
             expect(serialized).to.not.contain('enc1');
+            expect(serialized).to.not.contain('foreign');
         });
 
         it('skips a foreign-provider compaction marker without dropping the prefix', () => {
             const messages: LanguageModelMessage[] = [
                 userMessage('user A'),
-                compactionMessage('anthropic', 'enc1'),
+                compactionMessage('chatgpt-responses', 'enc1'),
                 userMessage('user B')
             ];
 
@@ -831,5 +1049,99 @@ describe('OpenAiResponseApiUtils', () => {
             expect(serialized).to.contain('ai B');
             expect(serialized).to.contain('user C');
         });
+    });
+
+    for (const nameSource of ['added', 'done', 'arguments'] as const) {
+        it(`preserves the streamed function name from the ${nameSource} event`, async () => {
+            const item = { id: 'item-1', call_id: 'call-1', type: 'function_call' as const, name: 'lookup', arguments: '{"query":"test"}' };
+            const argumentsDone = {
+                type: 'response.function_call_arguments.done', item_id: item.id,
+                arguments: item.arguments, output_index: 0, sequence_number: 1
+            } satisfies ResponseStreamEvent;
+            const payloads: Record<string, unknown>[] = [];
+            const streams = [
+                [
+                    ...(nameSource === 'added' ? [{ type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '' } }] : []),
+                    nameSource === 'arguments' ? { ...argumentsDone, name: item.name } : argumentsDone,
+                    { type: 'response.output_item.done', output_index: 0, item },
+                    { type: 'response.completed', response: {} }
+                ],
+                [{ type: 'response.completed', response: {} }]
+            ];
+            const openai = {
+                responses: {
+                    stream: (payload: Record<string, unknown>) => {
+                        payloads.push(payload);
+                        return toStream(streams.shift() ?? []);
+                    }
+                }
+            };
+            const handler = sinon.stub().resolves('found');
+            const request: UserRequest = {
+                sessionId: 'session-1', requestId: 'request-1',
+                messages: [{ actor: 'user', type: 'text', text: 'hello' }],
+                tools: [{ id: 'lookup', name: 'lookup', parameters: { type: 'object', properties: {} }, handler }]
+            };
+            const response = await utils.handleRequest(openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer', 'openai/gpt-5', true);
+            const parts: LanguageModelStreamResponsePart[] = [];
+            if ('stream' in response) {
+                for await (const part of response.stream) {
+                    parts.push(part);
+                }
+            }
+            sinon.assert.calledOnce(handler);
+            expect(handler.firstCall.args[0]).to.equal(item.arguments);
+            const finished = parts.filter(isToolCallResponsePart).flatMap(part => part.tool_calls).find(call => call.finished);
+            expect(finished?.function?.name).to.equal('lookup');
+            expect(finished?.result).to.equal('found');
+            expect(payloads).to.have.lengthOf(2);
+            expect(payloads[1].input).to.deep.include(item);
+            expect(payloads[1].input).to.deep.include({ type: 'function_call_output', call_id: item.call_id, output: 'found' });
+        });
+    }
+
+    it('executes the tool calls of a single turn concurrently', async () => {
+        const streams = [
+            [
+                ...outputItemEvents({ id: 'call-a', call_id: 'call-a', type: 'function_call', name: 'a', arguments: '{}' }, 0),
+                ...outputItemEvents({ id: 'call-b', call_id: 'call-b', type: 'function_call', name: 'b', arguments: '{}' }, 1),
+                { type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 1 } } }
+            ],
+            [
+                { type: 'response.output_text.delta', delta: 'done' },
+                { type: 'response.completed', response: { usage: { input_tokens: 2, output_tokens: 2 } } }
+            ]
+        ];
+        const openai = {
+            responses: {
+                stream: () => toStream(streams.shift() ?? [])
+            }
+        };
+        // `a` only resolves once `b` has started: a sequential implementation would deadlock here.
+        const bStarted = new Deferred<void>();
+        const request: UserRequest = {
+            sessionId: 'session-1',
+            requestId: 'request-1',
+            messages: [{ actor: 'user', type: 'text', text: 'hello' }],
+            tools: [
+                { id: 'a', name: 'a', parameters: { type: 'object', properties: {} }, handler: async () => { await bStarted.promise; return 'a-result'; } },
+                { id: 'b', name: 'b', parameters: { type: 'object', properties: {} }, handler: async () => { bStarted.resolve(); return 'b-result'; } }
+            ]
+        };
+
+        const response = await utils.handleRequest(openai as never, request, {}, 'gpt-5', new OpenAiModelUtils(), 'developer', 'openai/gpt-5', true);
+        const parts: LanguageModelStreamResponsePart[] = [];
+        if ('stream' in response) {
+            for await (const part of response.stream) {
+                parts.push(part);
+            }
+        }
+
+        const finishedResults = parts
+            .filter(isToolCallResponsePart)
+            .flatMap(part => part.tool_calls)
+            .filter(call => call.finished)
+            .map(call => call.result);
+        expect(finishedResults).to.have.members(['a-result', 'b-result']);
     });
 });

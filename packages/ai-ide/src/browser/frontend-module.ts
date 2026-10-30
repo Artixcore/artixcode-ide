@@ -113,7 +113,7 @@ import { bindRootContributionProvider, CommandContribution, PreferenceContributi
 import { BrowserAutomation, browserAutomationPath } from '../common/browser-automation-protocol';
 import { GitHubRepoService, githubRepoServicePath } from '../common/github-repo-protocol';
 import { CloseBrowserProvider, IsBrowserRunningProvider, LaunchBrowserProvider, QueryDomProvider } from './app-tester-chat-functions';
-import { GetSkillFileContent } from './skill-file-functions';
+import { GetSkillFileContent, ListSkills } from './skill-file-functions';
 import { aiIdePreferenceSchema } from '../common/ai-ide-preferences';
 import { AIActivationService } from '@theia/ai-core/lib/browser';
 import { AIIdeActivationServiceImpl } from './ai-ide-activation-service';
@@ -121,7 +121,7 @@ import { AiConfigurationPreferences } from '../common/ai-configuration-preferenc
 import { WorkspaceRestrictionContribution } from '@theia/workspace/lib/browser/workspace-trust-service';
 import { AIWorkspaceRestrictionContribution } from './ai-workspace-restriction-contribution';
 
-import { ProjectInfoAgent } from './project-info-agent';
+import { AgentsMdAgent } from './agents-md-agent';
 import { CreateSkillAgent } from './create-skill-agent';
 import { SuggestTerminalCommand } from './ai-terminal-functions';
 import { TodoWriteTool } from './todo-tool';
@@ -181,9 +181,9 @@ export default new ContainerModule((bind, _unbind, _isBound, rebind) => {
     bind(Agent).toService(CoderAgent);
     bind(ChatAgent).toService(CoderAgent);
 
-    bind(ProjectInfoAgent).toSelf().inSingletonScope();
-    bind(Agent).toService(ProjectInfoAgent);
-    bind(ChatAgent).toService(ProjectInfoAgent);
+    bind(AgentsMdAgent).toSelf().inSingletonScope();
+    bind(Agent).toService(AgentsMdAgent);
+    bind(ChatAgent).toService(AgentsMdAgent);
 
     bind(CreateSkillAgent).toSelf().inSingletonScope();
     bind(Agent).toService(CreateSkillAgent);
@@ -246,6 +246,7 @@ export default new ContainerModule((bind, _unbind, _isBound, rebind) => {
     bindToolProvider(FileDiagnosticProvider, bind);
     bindToolProvider(FindFilesByPattern, bind);
     bindToolProvider(GetSkillFileContent, bind);
+    bindToolProvider(ListSkills, bind);
     bind(WorkspaceFunctionScope).toSelf().inSingletonScope();
     bindToolProvider(WorkspaceSearchProvider, bind);
 

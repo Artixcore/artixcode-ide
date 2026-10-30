@@ -58,6 +58,7 @@ import {
     ReferenceContext,
     TextDocumentShowOptions,
     WorkspaceRootsChangeEvent,
+    WorkspaceFolderToAdd,
     Location,
     Breakpoint,
     ColorPresentation,
@@ -783,7 +784,7 @@ export interface WorkspaceMain {
     $registerTextDocumentContentProvider(scheme: string): Promise<void>;
     $unregisterTextDocumentContentProvider(scheme: string): void;
     $onTextDocumentContentChange(uri: string, content: string): void;
-    $updateWorkspaceFolders(start: number, deleteCount?: number, ...rootsToAdd: string[]): Promise<void>;
+    $updateWorkspaceFolders(start: number, deleteCount?: number, ...rootsToAdd: WorkspaceFolderToAdd[]): Promise<void>;
     $getWorkspace(): Promise<files.FileStat | undefined>;
     $requestWorkspaceTrust(options?: theia.WorkspaceTrustRequestOptions): Promise<boolean | undefined>;
     $resolveProxy(url: string): Promise<string | undefined>;
@@ -1104,6 +1105,8 @@ export interface SourceControlGroupFeatures {
 export interface ScmRawResource {
     handle: number,
     sourceUri: UriComponents,
+    multiDiffEditorOriginalUri?: UriComponents,
+    multiDiffEditorModifiedUri?: UriComponents,
     icons: (IconUrl | ThemeIcon | undefined)[], /* icons: light, dark */
     tooltip: string,
     strikeThrough: boolean,
